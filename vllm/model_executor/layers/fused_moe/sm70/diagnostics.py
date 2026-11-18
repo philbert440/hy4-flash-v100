@@ -25,7 +25,10 @@ RoutedExperts = Any
 def _silu_and_mul_w13(
     layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
 ) -> None:
-    if getattr(layer, "sm70_awq_moe_w13_interleaved", False):
+    limit = getattr(layer, "swiglu_limit", None)
+    if limit is not None:
+        torch.ops._C.silu_and_mul_with_clamp(out, gate_up, limit)
+    elif getattr(layer, "sm70_awq_moe_w13_interleaved", False):
         sm70_ops.silu_and_mul_interleaved(out, gate_up)
     else:
         torch.ops._C.silu_and_mul(out, gate_up)

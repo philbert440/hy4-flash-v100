@@ -272,6 +272,14 @@ def _is_qwen38_tp4_compact_metadata_shape(
     )
 
 
+def _supports_compact_metadata_shape(layer: RoutedExperts, group_size: int) -> bool:
+    return _is_qwen38_tp4_compact_metadata_shape(layer, group_size) or (
+        group_size == 32
+        and tuple(layer.w13_qweight.shape) == (512, 1536, 96)
+        and tuple(layer.w2_qweight.shape) == (512, 384, 192)
+    )
+
+
 def _resolve_compact_metadata(
     *, requested: bool, explicit: bool, native_available: bool, shape_ok: bool
 ) -> bool:
@@ -293,7 +301,7 @@ def _resolve_compact_metadata(
             )
         raise RuntimeError(
             "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 currently requires "
-            "the exact Qwen3.8 TP4 E512 native-g32 W13/W2 shapes."
+            "Qwen3.8 TP4 or HYV4 Flash TP4 E512 native-g32 W13/W2 shapes."
         )
     logger.info_once(
         "SM70 AWQ MoE compact metadata default skipped (%s); "
@@ -605,10 +613,11 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
             requested=bool(self.sm70_moe_policy.compact_metadata),
             explicit="compact_metadata" in self.sm70_moe_policy.explicit_fields,
             native_available=hasattr(torch.ops._C, "awq_sm70_prepare_compact"),
-            shape_ok=_is_qwen38_tp4_compact_metadata_shape(layer, self.group_size),
+            shape_ok=_supports_compact_metadata_shape(layer, self.group_size),
         )
         build_legacy_w13 = (
-            batched_gemm
+            getattr(layer, "swiglu_limit", None) is None
+            and batched_gemm
             and bool(self.sm70_moe_policy.legacy_compact)
             and hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
         )
@@ -792,9 +801,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
             num_experts,
         )
         if compact_metadata:
-            logger.info_once(
-                "SM70 Qwen3.8 TP4 AWQ compact scale/zero metadata enabled."
-            )
+            logger.info_once("SM70 TP4 AWQ compact scale/zero metadata enabled.")
 
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
@@ -1245,10 +1252,14 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
             and not use_batched_single_token_strict
             and self.single_token_indexed
         )
-        if num_tokens == 1 and (
-            not layer.sm70_awq_moe_batched_gemm
-            or use_batched_single_token_strict
-            or use_batched_single_token_indexed
+        if (
+            getattr(layer, "swiglu_limit", None) is None
+            and num_tokens == 1
+            and (
+                not layer.sm70_awq_moe_batched_gemm
+                or use_batched_single_token_strict
+                or use_batched_single_token_indexed
+            )
         ):
             plan = (
                 self.strict_single_token_plan

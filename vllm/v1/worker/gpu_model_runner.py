@@ -1331,11 +1331,18 @@ class GPUModelRunner(
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
 
-        ple_layer_ids = getattr(model_config.hf_text_config, "ple_layer_ids", ())
+        text_config = model_config.hf_text_config
+        ple_layer_ids = getattr(text_config, "ple_layer_ids", ())
         self.uses_ngram_embedding = bool(ple_layer_ids)
-        if self.uses_ngram_embedding:
-            self.ngram_context_len = int(model_config.hf_text_config.ngram_size) - 1
-            self.ngram_eos_token_id = int(model_config.hf_text_config.eos_token_id)
+        self.uses_flash_engram = text_config.model_type == "hy_v4_flash" and bool(
+            text_config.engram_layer_ids
+        )
+        if self.uses_flash_engram:
+            self.ngram_context_len = int(text_config.engram_max_ngram_size) - 1
+            self.ngram_eos_token_id = int(text_config.engram_pad_id)
+        elif self.uses_ngram_embedding:
+            self.ngram_context_len = int(text_config.ngram_size) - 1
+            self.ngram_eos_token_id = int(text_config.eos_token_id)
         else:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -1727,7 +1734,7 @@ class GPUModelRunner(
         self.inputs_embeds = self._make_buffer(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
-        if self.uses_ngram_embedding:
+        if self.uses_ngram_embedding or self.uses_flash_engram:
             self.ngram_context = self._make_buffer(
                 self.max_num_reqs,
                 self.ngram_context_len,
@@ -7035,10 +7042,7 @@ class GPUModelRunner(
         num_reqs: int,
         num_reqs_padded: int,
     ) -> torch.Tensor:
-        """Copy committed per-request token history into the PLE context."""
-        if not self.uses_ngram_embedding:
-            raise RuntimeError("N-gram context requested for a non-PLE model")
-
+        """Copy committed per-request token history into the n-gram context."""
         eos_token_id = int(self.ngram_eos_token_id)
         context_cpu = self.ngram_context.np[:num_reqs_padded]
         context_cpu.fill(eos_token_id)
@@ -7090,7 +7094,20 @@ class GPUModelRunner(
         query_start_loc: torch.Tensor | None = None,
         num_scheduled_tokens: Sequence[int] | np.ndarray | None = None,
     ) -> None:
-        if not self.uses_ngram_embedding or not is_first_rank or is_encoder_decoder:
+        if not is_first_rank or is_encoder_decoder:
+            return
+
+        if getattr(self, "uses_flash_engram", False):
+            if use_dummy_context:
+                self.ngram_context.np[:num_reqs_padded].fill(self.ngram_eos_token_id)
+                self._copy_buffer_to_gpu(self.ngram_context, num_reqs_padded)
+                context = self.ngram_context.gpu[:num_reqs_padded]
+            else:
+                context = self._prepare_ngram_context(num_reqs, num_reqs_padded)
+            model_kwargs["lookback_token_ids"] = context
+            return
+
+        if not self.uses_ngram_embedding:
             return
 
         if query_start_loc is None:
@@ -7216,7 +7233,7 @@ class GPUModelRunner(
             model_kwargs = self._init_model_kwargs()
 
         if (
-            self.uses_ngram_embedding
+            (self.uses_ngram_embedding or self.uses_flash_engram)
             and is_first_rank
             and not is_encoder_decoder
             and input_ids is None
@@ -8576,7 +8593,7 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> bool | None:
-        """Reject uniform-decode dispatch for hybrid-model prefills.
+        """Reject uniform-decode dispatch for hybrid and Hy4 Flash prefills.
 
         A prefill can have the same shape as a uniform decode batch, notably
         when its scheduled token count equals ``1 + num_speculative_tokens``.
@@ -8586,9 +8603,13 @@ class GPUModelRunner(
         current step as well.
 
         ``None`` preserves the normal shape heuristic. ``False`` is only
-        returned when a hybrid batch contains an unfinished prompt.
+        returned when a batch requiring a separate prefill path contains an
+        unfinished prompt.
         """
-        if not self.model_config.is_hybrid:
+        if (
+            not self.model_config.is_hybrid
+            and self.model_config.hf_text_config.model_type != "hy_v4_flash"
+        ):
             return None
 
         for new_req in scheduler_output.scheduled_new_reqs:
