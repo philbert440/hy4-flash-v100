@@ -6,6 +6,8 @@ GPUs, with the `fast14` launch profile. It runs leoncca's
 plain and about 138 tok/s with the built-in DFly2 drafter.
 
 - Recipe: [HY4-V100.md](HY4-V100.md)
+- Prebuilt SM70 wheel and our shared-expert cache:
+  [release `hy4-fast14-20261124b`](https://github.com/philbert440/hy4-flash-v100/releases/tag/hy4-fast14-20261124b)
 - Model page with measurements: https://philtompkins.com/models/hy4-flash
 - Upstream engine: https://github.com/1CatAI/1Cat-vLLM
 
@@ -16,16 +18,18 @@ plain and about 138 tok/s with the built-in DFly2 drafter.
 | Upstream | 1Cat-vLLM `main` @ [`1fa9c438bc6e593dbfdd9430b23012a82023bed8`](https://github.com/1CatAI/1Cat-vLLM/commit/1fa9c438bc6e593dbfdd9430b23012a82023bed8) (2026-11-19) |
 | Hy4-flash support | Leonccaa's port from [ReVolta](https://github.com/Leonccaa/ReVolta) `v0.2.0rc13`, 47 commits applied as one |
 | This engine | the `fast14` speed work, squashed, plus the shared-expert cache tool |
-| Tag | `hy4-fast14-20261124` |
+| Tags | `hy4-fast14-20261124` (engine as measured), `hy4-fast14-20261124b` (adds the cache `rebind` fix and the release docs) |
 
-The history is four commits and this README:
+The history is four commits, this README, and one follow-up:
 
 1. upstream `main`, unmodified, without upstream history;
 2. the ReVolta port, authored by Leonccaa. Its message lists the 47 ReVolta commit ids;
 3. the `fast14` engine. Its tree equals the measured engine except for publication edits: a test-harness hook in the
    RPC router is removed, test defaults no longer name local paths, and two documentation paths are generic. No
    kernel or model logic differs;
-4. `tools/hy4/shared_w8_cache.py`, which builds the shared-expert int8 cache the fast profiles need.
+4. `tools/hy4/shared_w8_cache.py`, which builds the shared-expert int8 cache the fast profiles need;
+5. the follow-up: `rebind` accepts a downloaded cache on any copy of the same checkpoint, and the recipe covers the
+   prebuilt wheel and the downloadable cache. Engine code is unchanged from `hy4-fast14-20261124`.
 
 Every speed path sits behind its own environment switch. `VLLM_HY4_PROFILE=reference` turns them all off and
 `VLLM_HY4_PROFILE=fast14` turns on the measured set. See `vllm/models/hy_v4_flash/profile.py`.
@@ -38,4 +42,6 @@ Every speed path sits behind its own environment switch. `VLLM_HY4_PROFILE=refer
   `OVERLAY-LEDGER.md`.
 - Model: Hy4-flash by the Tencent Hy Team, under the
   [Tencent Hy License, Version 1.0](https://huggingface.co/tencent/Hy4-flash/blob/main/LICENSE). The weights this
-  engine runs are leoncca's quantized derivative under the same licence. This repo contains no weights.
+  engine runs are leoncca's quantized derivative under the same licence. This repo contains no weights. The release's
+  shared-expert cache is quantized from those weights, so it is also under the Tencent Hy License; the release
+  includes the licence text and a NOTICE.

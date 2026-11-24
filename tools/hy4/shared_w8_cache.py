@@ -12,7 +12,9 @@ serve from and the install you serve with.
 
   calibrate  run the checkpoint on 4 GPUs over calibration text and write the
              packs to OUT/<checkpoint key>/<build key>/
-  rebind     reuse packs after a rebuild that changed only the build key
+  rebind     reuse verified packs: after a rebuild that changed the build
+             key, or with downloaded packs on a checkpoint with the same
+             content (the checkpoint key also covers modification times)
 """
 
 import argparse
@@ -56,6 +58,20 @@ def select(tokenizer, path: Path, docs: int, max_tokens: int, seed: int) -> list
     sys.exit(f"{path} has {len(selected)} documents of at least {MIN_TOKENS} tokens; need {docs}")
 
 
+def checkpoint_content(checkpoint: Path) -> str:
+    """Checkpoint identity without modification times, so packs can move between copies."""
+    files = {}
+    for path in sorted(checkpoint.iterdir()):
+        if path.suffix == ".json":
+            files[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif path.suffix == ".safetensors":
+            with path.open("rb") as reader:
+                size = int.from_bytes(reader.read(8), "little")
+                header = hashlib.sha256(reader.read(size)).hexdigest()
+            files[path.name] = [path.stat().st_size, header]
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
 def calibrate(args) -> None:
     os.environ.update(CALIBRATION_ENV)
     from transformers import AutoTokenizer
@@ -96,6 +112,7 @@ def calibrate(args) -> None:
 
     write_pack_manifest(staging, {
         "checkpoint": checkpoint_key,
+        "checkpoint_content": checkpoint_content(args.model),
         "build": build_key,
         "group_size": GROUP_SIZE,
         "calibration_token_counts": [len(ids) for ids in selected],
@@ -114,11 +131,18 @@ def rebind(args) -> None:
     source = args.cache.resolve()
     manifest = json.loads((source / "manifest.json").read_text())
     checkpoint_key, build_key = pack_identity(args.model)
-    if manifest["checkpoint"] != checkpoint_key:
+    content = manifest.get("checkpoint_content")
+    if content is not None:
+        if checkpoint_content(args.model) != content:
+            sys.exit("The checkpoint content differs from the one the packs were made for "
+                     "(file names, sizes, safetensors headers or JSON files). Calibrate again.")
+    elif manifest["checkpoint"] != checkpoint_key:
         sys.exit("The checkpoint key differs: the packs belong to another checkpoint "
                  "directory or its files changed. Calibrate again.")
     for entry in manifest["ranks"]:
         path = source / f"{entry['rank']}.pt"
+        if "sha256" not in entry:
+            sys.exit(f"{source / 'manifest.json'} has no SHA-256 for {entry['rank']}")
         if _file_sha256(path) != entry["sha256"]:
             sys.exit(f"SHA-256 mismatch for {path}")
     dest = args.out / checkpoint_key / build_key
@@ -130,7 +154,8 @@ def rebind(args) -> None:
         link = dest / f"{entry['rank']}.pt"
         if not link.exists():
             link.symlink_to((source / link.name).resolve())
-    rebound = {**manifest, "build": build_key, "rebound_from": str(source)}
+    rebound = {**manifest, "checkpoint": checkpoint_key, "build": build_key,
+               "rebound_from": str(source)}
     (dest / "manifest.json").write_text(json.dumps(rebound, indent=2) + "\n")
     print(dest)
 
@@ -152,7 +177,7 @@ def main() -> None:
     reb = sub.add_parser("rebind")
     reb.add_argument("--model", type=Path, required=True)
     reb.add_argument("--cache", type=Path, required=True,
-                     help="existing pack directory with manifest.json")
+                     help="existing or downloaded pack directory with manifest.json")
     reb.add_argument("--out", type=Path, required=True, help="cache root")
     reb.set_defaults(run=rebind)
     args = parser.parse_args()
