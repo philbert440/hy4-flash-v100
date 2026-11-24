@@ -1,0 +1,477 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Opt-in online QPN8 route for Qwen4Exp FP16 decode projections on SM70.
+
+This route requantizes selected dense checkpoint weights at load time. It is a
+performance experiment rather than a precision-preserving checkpoint route and
+therefore requires an explicit environment opt-in.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+
+from vllm import _sm70_ops as sm70_ops
+from vllm.config import get_current_vllm_config
+from vllm.config.execution_policy import layer_policy
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    register_layer_workspace,
+    workspace_pool,
+)
+from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from torch import nn
+
+
+logger = init_logger(__name__)
+
+_STATE_ATTR = "_sm70_qwen4_exp_online_qpn8"
+_CODES_ATTR = "_sm70_qwen4_exp_online_qpn8_codes"
+_SCALES_ATTR = "_sm70_qwen4_exp_online_qpn8_scales"
+_HC_PARTIALS_ATTR = "_sm70_qwen4_exp_online_qpn8_hc_partials"
+_WORKSPACE_ELEMENTS = 4096 * 2560
+_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+_hc_partials: dict[int, torch.Tensor] = {}
+
+_HC_DOWN_SUFFIX = ".input_mix_weight_down_block_inject"
+_HC_DOWN_LOGICAL_N = 336
+_HC_DOWN_PADDED_N = 384
+
+_REQUIRED_OPS = (
+    "fp8_qpn8_prepare_sm70",
+    "fp8_qpn8_dispatch_sm70_out",
+)
+
+
+def _shape_config(prefix: str, k: int, n: int) -> tuple[int, int, bool] | None:
+    """Return the measured ``split_k, nacc, prefetch`` for one local weight."""
+    if prefix.endswith(_HC_DOWN_SUFFIX) and (k, n) == (
+        10240,
+        _HC_DOWN_LOGICAL_N,
+    ):
+        return 32, 1, False
+    if prefix.endswith(".input_mix_weight_up") and (k, n) == (320, 10240):
+        return 4, 2, False
+    if prefix.endswith(".linear_attn.in_proj_qkvz") and (k, n) == (2560, 4096):
+        return 16, 1, False
+    if prefix.endswith(".linear_attn.out_proj") and (k, n) == (1536, 2560):
+        return 12, 2, False
+    if prefix.endswith(".self_attn.qkv_proj") and (k, n) == (2560, 3584):
+        return 16, 1, False
+    if prefix.endswith(".self_attn.o_proj") and (k, n) == (1536, 2560):
+        return 12, 2, False
+    return None
+
+
+def _exact_runtime_contract() -> bool:
+    try:
+        config = get_current_vllm_config()
+        text_config = config.model_config.hf_text_config
+        tp_size = get_tensor_model_parallel_world_size()
+    except (AssertionError, AttributeError, RuntimeError):
+        return False
+    return bool(
+        tp_size == 4
+        and config.speculative_config is None
+        and int(getattr(text_config, "hidden_size", 0)) == 2560
+        and int(getattr(text_config, "num_hidden_layers", 0)) == 48
+        and int(getattr(text_config, "num_experts", 0)) == 512
+        and int(getattr(text_config, "num_experts_per_tok", 0)) == 10
+        and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
+        and int(getattr(text_config, "hc_count", 0)) == 4
+        and int(getattr(text_config, "hc_lowrank", 0)) == 320
+        and int(getattr(text_config, "num_attention_heads", 0)) == 24
+        and int(getattr(text_config, "num_key_value_heads", 0)) == 2
+        and int(getattr(text_config, "indexer_head_dim", 0)) == 128
+        and int(getattr(text_config, "indexer_budget", 0)) == 2048
+        and int(getattr(text_config, "indexer_compress_ratio", 0)) == 4
+    )
+
+
+def _workspace(weight: torch.Tensor) -> torch.Tensor:
+    device_index = weight.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    key = (device_index, weight.dtype)
+    pool = workspace_pool("online_qpn8", _workspaces)
+    workspace = pool.get(key)
+    if workspace is None:
+        workspace = torch.empty(
+            (_WORKSPACE_ELEMENTS,), dtype=torch.float16, device=weight.device
+        )
+        pool[key] = workspace
+    return workspace
+
+
+def _hc_workspace(weight: torch.Tensor) -> torch.Tensor:
+    device_index = weight.device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    pool = workspace_pool("online_qpn8_hc", _hc_partials)
+    partials = pool.get(device_index)
+    if partials is None:
+        partials = torch.empty(
+            (32 * _HC_DOWN_PADDED_N,),
+            dtype=torch.float32,
+            device=weight.device,
+        )
+        pool[device_index] = partials
+    return partials
+
+
+@torch.inference_mode()
+def prepare_channel_qpn8_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reuse the channel-QPN8 layout with bounded FP32 startup scratch."""
+    rows, _ = weight.shape
+    qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((rows, 1), dtype=torch.float32, device=weight.device)
+    for begin in range(0, rows, 4096):
+        end = min(begin + 4096, rows)
+        values = weight[begin:end].float()
+        scale = values.abs().amax(dim=1, keepdim=True) / 448
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        qweight[begin:end].copy_((values / scale).to(torch.float8_e4m3fn))
+        scales[begin:end].copy_(scale)
+    codes, packed_scales = sm70_ops.fp8_qpn8_prepare_sm70(
+        qweight.contiguous(), scales.contiguous()
+    )
+    return codes, packed_scales
+
+
+def _prepare_gdn_mixed_qpn8(layer: nn.Module) -> bool:
+    """Convert unquantized GDN qkvz/out projections in mixed checkpoints to QPN8."""
+    if getattr(layer, "_sm70_gdn_mixed_qpn8_ready", False):
+        return True
+    if not getattr(layer, "_sm70_gdn_mixed_qpn8", False):
+        return False
+    import vllm.envs as envs
+
+    if envs.VLLM_BATCH_INVARIANT:
+        return False
+    weight = getattr(layer, "weight", None)
+    if (
+        weight is None
+        or weight.dtype != torch.float16
+        or not weight.is_cuda
+        or weight.ndim != 2
+        or not current_platform.is_device_capability(70)
+    ):
+        return False
+    n, k = (int(dim) for dim in weight.shape)
+    if n <= 0 or k <= 0 or n % 32 != 0 or k % 128 != 0:
+        return False
+
+    from vllm._sm70.policy import NativeBindings
+    from vllm.config.sm70_native import capture_linear_native_config
+    from vllm.model_executor.kernels.linear.qpn.fp8 import (
+        _get_sm70_fp8_prefill_exact_dense_workspace,
+        _missing_sm70_fp8_qpn8_ops,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
+        _SM70_CHANNEL_FP8_QPN8_CONFIGS,
+    )
+    from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
+
+    if _missing_sm70_fp8_qpn8_ops():
+        return False
+    codes, scales = prepare_channel_qpn8_weight(weight)
+    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if workspace is None:
+        return False
+
+    split_k, nacc, prefetch = _SM70_CHANNEL_FP8_QPN8_CONFIGS.get(
+        (k, n), (8 if k % 256 else 16, 2, False)
+    )
+    replace_parameter(layer, "weight", codes)
+    if "weight_scale_inv" in layer._parameters:
+        replace_parameter(layer, "weight_scale_inv", scales)
+    else:
+        layer.register_parameter(
+            "weight_scale_inv",
+            torch.nn.Parameter(scales, requires_grad=False),
+        )
+    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = workspace.data_ptr()
+    if getattr(layer, "prefix", "") and (
+        sm70_layer_workspaces._engine_workspace_registry() is not None
+        or layer.prefix not in sm70_layer_workspaces._layer_workspaces
+    ):
+        register_layer_workspace(layer, workspace, family="fp8")
+    layer.sm70_fp8_turbomind = True
+    layer.sm70_fp8_qpn8 = True
+    layer.sm70_fp8_channel_scale = True
+    layer.sm70_fp8_qpn8_split_k = split_k
+    layer.sm70_fp8_qpn8_nacc = nacc
+    layer.sm70_fp8_qpn8_prefetch = prefetch
+    layer._sm70_gdn_mixed_qpn8_shape = (n, k)
+    layer._sm70_gdn_mixed_qpn8_native_ops = NativeBindings(
+        capture_linear_native_config("fp8").values
+    )
+    layer._sm70_gdn_mixed_qpn8_ready = True
+    layer._direct_output_ready = True
+    logger.info_once(
+        "SM70 mixed-checkpoint GDN qkvz/out projections use channel-QPN8 "
+        "(FP16 weights released)."
+    )
+    return True
+
+
+def _apply_gdn_mixed_qpn8(
+    layer: nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if not getattr(layer, "_sm70_gdn_mixed_qpn8_ready", False):
+        return None
+    if x.dtype != torch.float16:
+        raise RuntimeError(
+            f"SM70 mixed GDN channel-QPN8 requires float16 activations, got {x.dtype}."
+        )
+    n, k = layer._sm70_gdn_mixed_qpn8_shape
+    out_shape = (*x.shape[:-1], n)
+    x_2d = x.reshape(-1, k)
+    if x_2d.stride(-1) != 1:
+        x_2d = x_2d.contiguous()
+    if output is not None:
+        if (
+            output.shape != out_shape
+            or output.dtype != x.dtype
+            or output.device != x.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError("Invalid SM70 GDN QPN8 projection output buffer")
+        out_2d = output.reshape(-1, n)
+    else:
+        out_2d = x_2d.new_empty((x_2d.shape[0], n))
+    if x_2d.shape[0] > 0:
+        torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+            out_2d,
+            x_2d,
+            layer.weight,
+            layer.weight_scale_inv,
+            int(layer.sm70_fp8_qpn8_split_k),
+            int(layer.sm70_fp8_qpn8_nacc),
+            bool(layer.sm70_fp8_qpn8_prefetch),
+            False,
+            layer._sm70_gdn_mixed_qpn8_native_ops.arguments,
+        )
+    if bias is not None:
+        out_2d.add_(bias)
+    return out_2d.reshape(out_shape)
+
+
+def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
+    """Quantize one admitted FP16 weight and retain only its QPN8 layout."""
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        prepare_mtp_draft_qpn8,
+    )
+
+    if prepare_mtp_draft_qpn8(layer):
+        return True
+    if _prepare_gdn_mixed_qpn8(layer):
+        return True
+    if getattr(layer, _STATE_ATTR, False):
+        return True
+    if not layer_policy().value("online_qpn8") or not _exact_runtime_contract():
+        return False
+    if any(not hasattr(torch.ops._C, name) for name in _REQUIRED_OPS):
+        raise RuntimeError(
+            "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8=1 requires the SM70 QPN8 ops"
+        )
+    weight = getattr(layer, "weight", None)
+    if (
+        weight is None
+        or weight.dtype != torch.float16
+        or not weight.is_cuda
+        or weight.ndim != 2
+        or not current_platform.is_device_capability(70)
+    ):
+        return False
+
+    logical_n, k = (int(dim) for dim in weight.shape)
+    prefix = str(getattr(layer, "prefix", ""))
+    config = _shape_config(prefix, k, logical_n)
+    if config is None:
+        return False
+    padded_n = _HC_DOWN_PADDED_N if prefix.endswith(_HC_DOWN_SUFFIX) else logical_n
+    if padded_n % 32 or k % 16:
+        raise RuntimeError(f"online QPN8 received an unaligned weight {(padded_n, k)}")
+
+    if padded_n != logical_n:
+        padding = weight.new_zeros((padded_n - logical_n, k))
+        weight_for_quant = torch.cat((weight, padding), dim=0)
+    else:
+        weight_for_quant = weight
+
+    codes, scales = prepare_channel_qpn8_weight(weight_for_quant)
+    workspace = _workspace(weight)
+    register_layer_workspace(layer, workspace, family="fp8")
+
+    replace_parameter(layer, "weight", codes)
+    replace_parameter(layer, "weight_scale_inv", scales)
+    setattr(layer, _CODES_ATTR, layer.weight)
+    setattr(layer, _SCALES_ATTR, layer.weight_scale_inv)
+    layer._sm70_qwen4_exp_online_qpn8_k = k
+    layer._sm70_qwen4_exp_online_qpn8_n = padded_n
+    layer._sm70_qwen4_exp_online_qpn8_logical_n = logical_n
+    layer._sm70_qwen4_exp_online_qpn8_split_k = config[0]
+    layer._sm70_qwen4_exp_online_qpn8_nacc = config[1]
+    layer._sm70_qwen4_exp_online_qpn8_prefetch = config[2]
+    layer._sm70_qwen4_exp_online_qpn8_workspace = workspace
+    layer._sm70_qwen4_exp_online_qpn8_workspace_ptr = workspace.data_ptr()
+    if prefix.endswith(_HC_DOWN_SUFFIX):
+        # Resolve the shared scratch tensor while weights are prepared. Looking
+        # it up through a workspace dictionary from forward makes
+        # TorchDynamo emit a dictionary clear/update, which cudagraph rejects
+        # as a module-state mutation.
+        layer.register_buffer(
+            _HC_PARTIALS_ATTR,
+            _hc_workspace(weight),
+            persistent=False,
+        )
+    layer.sm70_fp8_qpn8 = True
+    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = workspace.data_ptr()
+    setattr(layer, _STATE_ATTR, True)
+    logger.warning_once(
+        "Experimental SM70 Qwen4Exp online channel-QPN8 is requantizing "
+        "selected FP16 decode projections; model-level quality is not "
+        "guaranteed."
+    )
+    return True
+
+
+def maybe_apply_online_qpn8(
+    layer: nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Run a prepared channel-QPN8 projection, or return ``None``."""
+    gdn_output = _apply_gdn_mixed_qpn8(layer, x, bias, output=output)
+    if gdn_output is not None:
+        return gdn_output
+    if output is not None:
+        return None
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        apply_mtp_draft_qpn8,
+    )
+
+    draft_output = apply_mtp_draft_qpn8(layer, x, bias)
+    if draft_output is not None:
+        return draft_output
+    if not getattr(layer, _STATE_ATTR, False):
+        return None
+    k = int(layer._sm70_qwen4_exp_online_qpn8_k)
+    n = int(layer._sm70_qwen4_exp_online_qpn8_n)
+    logical_n = int(layer._sm70_qwen4_exp_online_qpn8_logical_n)
+    if x.dtype != torch.float16 or x.shape[-1] != k:
+        raise RuntimeError(
+            "SM70 Qwen4Exp online QPN8 requires FP16 inputs with "
+            f"K={k}, got dtype={x.dtype} shape={tuple(x.shape)}"
+        )
+    x_2d = x.reshape(-1, k)
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+    out = torch.empty((x_2d.size(0), n), dtype=x.dtype, device=x.device)
+    torch.ops.vllm.sm70_fp8_qpn8_dispatch(
+        out,
+        layer.prefix,
+        x_2d,
+        getattr(layer, _CODES_ATTR),
+        getattr(layer, _SCALES_ATTR),
+        int(layer._sm70_qwen4_exp_online_qpn8_split_k),
+        int(layer._sm70_qwen4_exp_online_qpn8_nacc),
+        bool(layer._sm70_qwen4_exp_online_qpn8_prefetch),
+        False,
+    )
+    logical_out = out[:, :logical_n]
+    if bias is not None:
+        logical_out.add_(bias)
+    return logical_out.reshape(*x.shape[:-1], logical_n)
+
+
+def maybe_apply_fused_hc(
+    down_layer: nn.Module,
+    up_layer: nn.Module,
+    xn: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the exact Qwen4Exp HC projection pair through one opaque route."""
+    if not (
+        getattr(down_layer, _STATE_ATTR, False)
+        and getattr(up_layer, _STATE_ATTR, False)
+    ):
+        return None
+    if not sm70_ops.has_fp8_qpn8_hc_dispatch():
+        raise RuntimeError("prepared Qwen4Exp HC requires the fused QPN8 op")
+    if xn.dtype != torch.float16 or xn.ndim != 2 or xn.size(1) != 10240:
+        raise RuntimeError(
+            "fused Qwen4Exp HC requires a contiguous FP16 [M, 10240] input"
+        )
+    if not xn.is_contiguous():
+        xn = xn.contiguous()
+    if (
+        int(down_layer._sm70_qwen4_exp_online_qpn8_k) != 10240
+        or int(down_layer._sm70_qwen4_exp_online_qpn8_n) != _HC_DOWN_PADDED_N
+        or int(up_layer._sm70_qwen4_exp_online_qpn8_k) != 320
+        or int(up_layer._sm70_qwen4_exp_online_qpn8_n) != 10240
+    ):
+        raise RuntimeError("fused Qwen4Exp HC received incompatible weights")
+
+    down_workspace_ptr = int(down_layer._sm70_qwen4_exp_online_qpn8_workspace_ptr)
+    up_workspace_ptr = int(up_layer._sm70_qwen4_exp_online_qpn8_workspace_ptr)
+    if down_workspace_ptr != up_workspace_ptr:
+        raise RuntimeError("fused Qwen4Exp HC requires one shared dense workspace")
+    partials = getattr(down_layer, _HC_PARTIALS_ATTR, None)
+    if not isinstance(partials, torch.Tensor):
+        raise RuntimeError("fused Qwen4Exp HC requires prepared partials")
+
+    m = xn.size(0)
+    block_out = xn.new_empty((m, 2560))
+    injection_out = xn.new_empty((m, 4))
+    down_staging = xn.new_empty((m, _HC_DOWN_PADDED_N))
+    lora_staging = xn.new_empty((m, 320))
+    gate_staging = xn.new_empty((m, 10240))
+    torch.ops.vllm.sm70_online_qpn8_hc_dispatch(
+        block_out,
+        injection_out,
+        down_staging,
+        lora_staging,
+        gate_staging,
+        partials,
+        down_layer.prefix,
+        xn,
+        getattr(down_layer, _CODES_ATTR),
+        getattr(down_layer, _SCALES_ATTR),
+        getattr(up_layer, _CODES_ATTR),
+        getattr(up_layer, _SCALES_ATTR),
+    )
+    return block_out, injection_out
+
+
+def maybe_apply_online_qpn8_fused_silu(
+    layer: nn.Module,
+    x: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run fused gated-SiLU on a prepared channel-QPN8 projection, or ``None``."""
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        apply_mtp_draft_qpn8_fused_silu,
+    )
+
+    return apply_mtp_draft_qpn8_fused_silu(layer, x)
+
+
+__all__ = [
+    "_shape_config",
+    "maybe_apply_fused_hc",
+    "maybe_apply_online_qpn8",
+    "maybe_apply_online_qpn8_fused_silu",
+    "maybe_prepare_online_qpn8",
+]

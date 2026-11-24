@@ -1,0 +1,358 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""GGUF Q8_0 storage for Qwen4Exp MTP draft experts.
+
+Draft experts only propose tokens; the target verifies every one, so their
+precision changes acceptance, never the output distribution. Q8_0 halves the
+FP16 draft expert storage (1.17 -> 0.62 GiB per TP4 rank) and runs through the
+existing GGUF MoE operator (dp4a MMVQ for small batches, MMQ above 64 rows).
+"""
+
+import torch
+from torch import nn
+
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoEMethodBase,
+    MoEActivation,
+    RoutedExperts,
+)
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
+
+# Keep the calibrated large-M throughput after removing duplicate persistent
+# workspaces. Smaller chunks save transient bytes but cost ~2 ms per 8K call.
+_PREFILL_CHUNK = 2048
+
+GGML_Q8_0 = 8
+_BLOCK = 32
+_BLOCK_BYTES = 34  # FP16 scale + 32 int8 values
+
+
+def quantize_q8_0(weight: torch.Tensor) -> torch.Tensor:
+    """ggml ``quantize_row_q8_0_ref``: per 32 values d = amax / 127 (stored as
+    FP16), q = round(x / d) computed with the FP32 scale."""
+    if weight.shape[-1] % _BLOCK:
+        raise ValueError("Q8_0 needs whole blocks of 32 values")
+    x = weight.to(torch.float32).reshape(-1, _BLOCK)
+    d = x.abs().amax(dim=1, keepdim=True) / 127
+    inverse = torch.where(d > 0, 1 / d, torch.zeros_like(d))
+    q = torch.round(x * inverse).clamp_(-128, 127).to(torch.int8)
+    packed = torch.empty((x.shape[0], _BLOCK_BYTES), dtype=torch.uint8, device=x.device)
+    packed[:, :2] = d.to(torch.float16).view(torch.uint8)
+    packed[:, 2:] = q.view(torch.uint8)
+    return packed.reshape(*weight.shape[:-1], weight.shape[-1] // _BLOCK * _BLOCK_BYTES)
+
+
+def dequantize_q8_0(packed: torch.Tensor) -> torch.Tensor:
+    """Reference decoder for tests."""
+    blocks = packed.reshape(-1, _BLOCK_BYTES)
+    d = blocks[:, :2].contiguous().view(torch.float16).to(torch.float32)
+    q = blocks[:, 2:].contiguous().view(torch.int8).to(torch.float32)
+    values = (q * d).to(torch.float16)
+    return values.reshape(*packed.shape[:-1], packed.shape[-1] // _BLOCK_BYTES * _BLOCK)
+
+
+class MTPQ80MoEMethod(FusedMoEMethodBase):
+    """TP-sharded Q8_0 copies of the FP16/BF16 MTP experts."""
+
+    @property
+    def topk_indices_dtype(self):
+        return torch.int32
+
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        if (
+            hidden_size % _BLOCK
+            or intermediate_size_per_partition % _BLOCK
+            or params_dtype != torch.float16
+            or not self.moe.is_act_and_mul
+            or self.moe.has_bias
+            or self.moe.ep_size != 1
+            or self.moe.dp_size != 1
+        ):
+            raise ValueError(
+                "Q8_0 MTP experts need FP16 gated TP-only experts in 32-value blocks"
+            )
+        self.num_experts = num_experts
+        self.hidden = hidden_size
+        self.local = intermediate_size_per_partition
+        self.loaded: dict[str, set[int]] = {s: set() for s in ("w1", "w3", "w2")}
+        for name, n, k in (
+            ("w13_weight", 2 * self.local, hidden_size),
+            ("w2_weight", hidden_size, self.local),
+        ):
+            param = nn.Parameter(
+                torch.empty(
+                    (num_experts, n, k // _BLOCK * _BLOCK_BYTES), dtype=torch.uint8
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter(name, param)
+            set_weight_attrs(param, extra_weight_attrs)
+            set_weight_attrs(param, {"packed_expert_loader": self.load_expert})
+
+    def load_expert(self, layer, param, weight, shard, expert):
+        if shard not in self.loaded or expert in self.loaded[shard]:
+            raise ValueError("Duplicate or invalid Q8_0 MTP expert projection")
+        full = self.local * layer.tp_size
+        expected = (self.hidden, full) if shard == "w2" else (full, self.hidden)
+        if tuple(weight.shape) != expected or weight.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
+            raise ValueError("Q8_0 MTP experts need the floating checkpoint geometry")
+        start = layer.tp_rank * self.local
+        local = (
+            weight[:, start : start + self.local]
+            if shard == "w2"
+            else weight[start : start + self.local]
+        )
+        device = param.device if param.device.type == "cuda" else local.device
+        packed = quantize_q8_0(local.to(device=device, dtype=torch.float32))
+        if shard == "w2":
+            target = param[expert]
+        else:
+            first = 0 if shard == "w1" else self.local
+            target = param[expert, first : first + self.local]
+        target.copy_(packed)
+        self.loaded[shard].add(expert)
+
+    def process_weights_after_loading(self, layer):
+        if any(e != set(range(self.num_experts)) for e in self.loaded.values()):
+            raise ValueError("Incomplete Q8_0 MTP expert checkpoint")
+        from vllm.model_executor.layers.quantization.gguf_native import pad_weight_tail
+
+        # The common GGUF reader can fetch a final padded K tile. Preserve the
+        # logical Q8 bytes and give its last row the same zero storage tail as
+        # other original expert banks, including K160 TP shards.
+        for name in ("w13_weight", "w2_weight"):
+            weight = getattr(layer, name)
+            guarded = pad_weight_tail(weight, GGML_Q8_0)
+            if guarded is not weight:
+                replace_parameter(layer, name, guarded)
+        if layer.w13_weight.is_cuda and current_platform.is_device_capability((7, 0)):
+            max_needed = (
+                _SM70_FAST_MAX_TOKENS * (self.hidden // _BLOCK)
+                + _SM70_FAST_MAX_TOKENS * _SM70_FAST_MAX_TOPK * (self.local // _BLOCK)
+            ) * _Q8_1_BYTES
+            _get_sm70_mtp_q8_workspace(layer.w13_weight.device, max_needed)
+        stored = layer.w13_weight.numel() + layer.w2_weight.numel()
+        fp16 = 2 * self.num_experts * 3 * self.local * self.hidden
+        logger.info(
+            "Q8_0 MTP expert storage: %.0f MiB per rank (FP16: %.0f MiB).",
+            stored / 2**20,
+            fp16 / 2**20,
+        )
+
+    def maybe_make_prepare_finalize(self, routing_tables=None):
+        return None
+
+    def get_fused_moe_quant_config(self, layer):
+        return None
+
+    def apply(
+        self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
+    ):
+        if (
+            layer.expert_map is not None
+            or layer.activation != MoEActivation.SILU
+            or layer.apply_router_weight_on_input
+        ):
+            raise ValueError("Q8_0 MTP experts need TP-only output-weighted SiLU")
+        return torch.ops.vllm.qwen4_mtp_q8_0_moe(
+            x, layer.w13_weight, layer.w2_weight, topk_weights, topk_ids
+        )
+
+
+_ENABLE_SM70_MTP_Q8_FAST = True
+_Q8_1_BYTES = 36
+_SM70_FAST_MAX_TOKENS = 64
+_SM70_FAST_MAX_TOPK = 16
+_SM70_MAX_SMEM = 44 * 1024
+_SM70_MTP_Q8_WORKSPACE: dict[int, torch.Tensor] = {}
+
+
+def _get_sm70_mtp_q8_workspace(device: torch.device, needed_bytes: int) -> torch.Tensor:
+    dev_idx = device.index or 0
+    ws = _SM70_MTP_Q8_WORKSPACE.get(dev_idx)
+    if ws is None or ws.device != device or ws.numel() < needed_bytes:
+        alloc_bytes = max(needed_bytes, 512 * 1024)
+        alloc_bytes = (alloc_bytes + 255) & ~255
+        ws = torch.empty(alloc_bytes, dtype=torch.uint8, device=device)
+        _SM70_MTP_Q8_WORKSPACE[dev_idx] = ws
+    return ws
+
+
+def _can_use_sm70_mtp_q8_fast(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    if (
+        not _ENABLE_SM70_MTP_Q8_FAST
+        or not hasattr(torch.ops._C, "sm70_mtp_q8_0_moe_out")
+        or not x.is_cuda
+        or x.dtype != torch.float16
+        or x.ndim != 2
+        or not (1 <= x.shape[0] <= _SM70_FAST_MAX_TOKENS)
+        or x.shape[1] < _BLOCK
+        or x.shape[1] % _BLOCK != 0
+        or not current_platform.is_device_capability((7, 0))
+    ):
+        return False
+    if (
+        w13_weight.ndim != 3
+        or w2_weight.ndim != 3
+        or w13_weight.dtype != torch.uint8
+        or w2_weight.dtype != torch.uint8
+        or not w13_weight.is_contiguous()
+        or not w2_weight.is_contiguous()
+        or w13_weight.shape[1] < 2 * _BLOCK
+        or w13_weight.shape[1] % (2 * _BLOCK) != 0
+        or topk_ids.ndim != 2
+        or not (1 <= topk_ids.shape[1] <= _SM70_FAST_MAX_TOPK)
+        or topk_ids.dtype != torch.int32
+        or topk_weights.dtype != torch.float32
+        or topk_weights.shape != topk_ids.shape
+    ):
+        return False
+    hidden_groups = x.shape[1] // _BLOCK
+    inter_groups = (w13_weight.shape[1] // 2) // _BLOCK
+    return (
+        hidden_groups * _Q8_1_BYTES <= _SM70_MAX_SMEM
+        and topk_ids.shape[1] * inter_groups * _Q8_1_BYTES <= _SM70_MAX_SMEM
+    )
+
+
+def _qwen4_mtp_q8_0_moe(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    tokens = x.shape[0]
+    if tokens == 0:
+        return x.new_empty((0, x.shape[1]))
+    if _can_use_sm70_mtp_q8_fast(x, w13_weight, w2_weight, topk_weights, topk_ids):
+        x_c = x.contiguous()
+        tw_c = topk_weights.contiguous()
+        ti_c = topk_ids.contiguous()
+        hidden_groups = x_c.shape[1] // _BLOCK
+        inter_groups = (w13_weight.shape[1] // 2) // _BLOCK
+        needed = (
+            tokens * hidden_groups + tokens * ti_c.shape[1] * inter_groups
+        ) * _Q8_1_BYTES
+        ws = _get_sm70_mtp_q8_workspace(x_c.device, needed)
+        out = torch.empty_like(x_c)
+        torch.ops._C.sm70_mtp_q8_0_moe_out(
+            out, ws, x_c, w13_weight, w2_weight, tw_c, ti_c
+        )
+        logger.info_once("SM70 fused Q8_0 MTP draft MoE kernel enabled.")
+        return out
+
+    from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
+
+    def run(rows):
+        return fused_moe_gguf(
+            x[rows],
+            w13_weight,
+            w2_weight,
+            topk_weights[rows],
+            topk_ids[rows],
+            GGML_Q8_0,
+            GGML_Q8_0,
+            "silu",
+        )
+
+    if tokens <= _PREFILL_CHUNK:
+        return run(slice(None))
+    # Prefill: the GGUF MoE path keeps [tokens * top_k, hidden]
+    # temporaries; token chunks bound them (tokens are independent).
+    out = torch.empty_like(x)
+    for start in range(0, tokens, _PREFILL_CHUNK):
+        rows = slice(start, min(tokens, start + _PREFILL_CHUNK))
+        out[rows] = run(rows)
+    return out
+
+
+def _qwen4_mtp_q8_0_moe_fake(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    del w13_weight, w2_weight, topk_weights, topk_ids
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="qwen4_mtp_q8_0_moe",
+    op_func=_qwen4_mtp_q8_0_moe,
+    fake_impl=_qwen4_mtp_q8_0_moe_fake,
+)
+
+
+class MTPQ80Config(QuantizationConfig):
+    def __init__(self, fallback: QuantizationConfig | None = None):
+        super().__init__()
+        self.fallback = fallback
+        if fallback is not None:
+            self.packed_modules_mapping = fallback.packed_modules_mapping
+
+    def get_name(self):
+        return "q8_0_mtp_experts" if self.fallback is None else self.fallback.get_name()
+
+    def get_supported_act_dtypes(self):
+        return [torch.float16]
+
+    @classmethod
+    def get_min_capability(cls):
+        return 70
+
+    @staticmethod
+    def get_config_filenames():
+        return []
+
+    @classmethod
+    def from_config(cls, config):
+        raise NotImplementedError("Construct from the resolved unquantized MTP config")
+
+    def get_cache_scale(self, name):
+        return None if self.fallback is None else self.fallback.get_cache_scale(name)
+
+    def get_quant_method(self, layer, prefix):
+        method = (
+            None
+            if self.fallback is None
+            else self.fallback.get_quant_method(layer, prefix)
+        )
+        if isinstance(layer, RoutedExperts) and prefix.startswith("mtp.layers."):
+            if method is not None and not isinstance(method, UnquantizedFusedMoEMethod):
+                return method
+            return MTPQ80MoEMethod(layer.moe_config)
+        if method is not None:
+            return method
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        return None

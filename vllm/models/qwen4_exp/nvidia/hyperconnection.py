@@ -1,0 +1,723 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""HyperConnection (Gated Residual) utilities — NVIDIA model variant.
+
+Implements the HyperConnection residual scheme proposed in
+"HyperConnections" (https://arxiv.org/abs/2409.19606). This NVIDIA variant
+delays each HC combine to the following HC mix boundary. HC glue kernels,
+including fused combine+RMSNorm, live in ``ops/hc.py``; projections remain
+standard vLLM Linear modules.
+
+Hidden states between layers have shape ``[..., HC*HS]`` with HS inner
+(HC outer, HS inner — checkpoint-native layout).
+
+Typical usage inside a transformer decoder layer::
+
+    self.attn_hc = GatedResidual(hc_config)
+
+    hidden_states, block_input, injection = self.attn_hc.mix(hidden_states)
+    attention_output = attention(block_input)
+    hidden_states, block_input, injection = self.mlp_hc.combine_and_mix(
+        hidden_states, attention_output, injection
+    )
+"""
+
+from contextlib import nullcontext
+
+import torch
+from torch import nn
+
+from vllm.config import get_current_vllm_config_or_none
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
+from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
+    maybe_apply_fused_hc,
+)
+from vllm.model_executor.models.utils import maybe_prefix
+from vllm.utils.torch_utils import direct_register_custom_op
+
+from ..common.hyperconnection import (
+    GroupedGemmaRMSNorm,
+    HyperConnectionConfig,
+)
+from .ops.hc import (
+    grouped_gemma_rmsnorm,
+    hc_combine,
+    hc_combine_norm,
+    hc_gate_mix,
+    hc_silu,
+)
+from .sm70_fp16_hc import (
+    maybe_apply_qwen38_sm70_fp16_fused_hc,
+    maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine,
+    sharded_hc_project,
+)
+from .sm70_hcx import HCX_BATCH_M, can_defer_ll_allreduce, get_ll_allreduce_comm
+
+
+# ---------------------------------------------------------------------------
+# Gated-residual variant
+# ---------------------------------------------------------------------------
+class GatedResidual(nn.Module):
+    """Gated HyperConnection with learnable low-rank mixing and injection.
+
+    ``combine_and_mix()`` runs the pre pipeline (grouped GemmaRMSNorm -> merged
+    low-rank down+inject GEMM -> silu -> up GEMM -> sigmoid -> gated mean
+    over the HC streams). When passed a pending block output and an injection,
+    it fuses their residual combine with the RMSNorm. Final mixers use
+    ``use_combine=False`` and do not produce a new injection.
+
+    Weights: the norm owns the grouped GemmaRMSNorm affine; the projections
+    are vLLM Linear modules (merged replicated linear for down+inject), so
+    GEMM dispatch (e.g. the low-latency skinny GEMM) applies through the
+    standard quant_method mechanism.
+    """
+
+    def __init__(
+        self,
+        config: HyperConnectionConfig,
+        use_combine: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.lora_rank = config.hc_lowrank
+        self.hc_count = config.hc_count
+        self.hidden_size = config.hidden_size
+        self.use_combine = use_combine
+
+        norm_size = (
+            self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
+        )
+        group_size = config.hidden_size if config.hc_per_branch_norm else None
+        # Normalize each H-sized HC stream independently while retaining a
+        # separate affine weight for every element of the HC*H layout.
+        self.hc_norm = GroupedGemmaRMSNorm(
+            norm_size,
+            eps=config.rms_norm_eps,
+            group_size=group_size,
+            dtype=config.params_dtype,
+        )
+
+        # -- vLLM Linear weights --------------------------------------------
+        # The merged skinny-GEMM shape is physically padded to 16 rows to ensure
+        # good alignment and performant implementation chosen by CuBLAS heuristics.
+        self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
+        runtime = get_current_vllm_config_or_none()
+        sharded_storage = bool(
+            runtime is not None
+            and runtime.kernel_config.hc_weight_storage == "sharded"
+            and not is_offload_process()
+        )
+        # Loading staging only: pack on CPU and transfer final local shards.
+        # Replicated GPU allocations leave large unreclaimable allocator holes.
+        storage_context = torch.device("cpu") if sharded_storage else nullcontext()
+        with storage_context:
+            if use_combine:
+                self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
+                    self.hyper_hidden_size,
+                    [self.lora_rank, self.hc_count]
+                    + ([self.pad_size] if self.pad_size else []),
+                    bias=False,
+                    params_dtype=config.params_dtype,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
+                    return_bias=False,
+                    disable_tp=True,
+                )
+            else:
+                self.input_mix_weight_down = ReplicatedLinear(
+                    self.hyper_hidden_size,
+                    self.lora_rank,
+                    bias=False,
+                    params_dtype=config.params_dtype,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+                    return_bias=False,
+                )
+            self.input_mix_weight_up = ReplicatedLinear(
+                self.lora_rank,
+                self.hyper_hidden_size,
+                bias=False,
+                params_dtype=config.params_dtype,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "input_mix_weight_up"),
+                return_bias=False,
+            )
+        if sharded_storage:
+            down = (
+                self.input_mix_weight_down_block_inject
+                if use_combine
+                else self.input_mix_weight_down
+            )
+            for layer in (down, self.input_mix_weight_up):
+                layer.weight._vllm_keep_on_cpu = True
+                layer._hc_cpu_staging = True
+
+    def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if hasattr(self, "hc_shard_down"):
+            block, injection = sharded_hc_project(
+                xn, self.hc_shard_down, self.hc_shard_up
+            )
+            return block, injection if self.use_combine else None
+        if self.use_combine:
+            fused_fp16 = maybe_apply_qwen38_sm70_fp16_fused_hc(
+                self.input_mix_weight_down_block_inject,
+                self.input_mix_weight_up,
+                xn,
+                getattr(self, "_sm70_qwen38_fp16_fused_hc", False),
+            )
+            if fused_fp16 is not None:
+                return fused_fp16
+
+            fused = maybe_apply_fused_hc(
+                self.input_mix_weight_down_block_inject,
+                self.input_mix_weight_up,
+                xn,
+            )
+            if fused is not None:
+                return fused
+
+            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            down_and_injection = self.input_mix_weight_down_block_inject(xn)
+            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+        else:
+            fused_fp16_nc = maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine(
+                self.input_mix_weight_down,
+                self.input_mix_weight_up,
+                xn,
+                getattr(self, "_sm70_qwen38_fp16_fused_hc_no_combine", False),
+            )
+            if fused_fp16_nc is not None:
+                return fused_fp16_nc, None
+            lora = self.input_mix_weight_down(xn)
+            injection = None
+
+        lora = hc_silu(lora, self.hc_count)
+        gate = self.input_mix_weight_up(lora)
+        return hc_gate_mix(xn, gate, self.hc_count), injection
+
+    def mix(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        xn = grouped_gemma_rmsnorm(
+            hidden_states,
+            self.hc_norm.weight,
+            self.config.rms_norm_eps,
+            self.hc_count,
+        )
+
+        block_input, injection = self._project(xn)
+
+        return hidden_states, block_input, injection
+
+    def enable_partial_inputs(self, name: str, runtime=None) -> None:
+        """Block outputs reaching this module are TP partials from now on."""
+        self._partial_inputs = True
+        self._hcx_name = name
+        _PARTIAL_MODULES[name] = self
+        if runtime is not None and self.use_combine:
+            from .sm70_hcx import pack_down, pack_up
+
+            down = self.input_mix_weight_down_block_inject.weight
+            up = self.input_mix_weight_up.weight
+            if down.dtype == torch.float16 and tuple(down.shape) == (336, 10240):
+                self._hcx = runtime
+                device = self.hc_norm.weight.device
+                self._hcx_down = pack_down(down.data, runtime.logical_rank).to(device)
+                self._hcx_up = pack_up(up.data, runtime.logical_rank).to(device)
+
+    def _sequence_parallel_project(self, normalized):
+        from .sm70_fp16_hc import sharded_hc_project_sequence_rows
+
+        if not hasattr(self, "hc_shard_down"):
+            raise ValueError("HC sequence rows require prepared sharded weights")
+        block, injection = sharded_hc_project_sequence_rows(
+            normalized, self.hc_shard_down, self.hc_shard_up
+        )
+        return block, injection if self.use_combine else None
+
+    def sequence_parallel_mix(self, hidden_states):
+        normalized = grouped_gemma_rmsnorm(
+            hidden_states, self.hc_norm.weight, self.config.rms_norm_eps, self.hc_count
+        )
+        block, injection = self._sequence_parallel_project(normalized)
+        return hidden_states, block, injection
+
+    def _sequence_parallel_block(self, block_output):
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        first, second = self._partial_pair(block_output)
+        if getattr(self, "_partial_inputs", False):
+            if second is not None:
+                source = first.float() + second.float()
+                return group.reduce_scatter(source, dim=0).to(first.dtype)
+            return group.reduce_scatter(first, dim=0)
+        return first.reshape(4, -1, first.shape[-1])[group.rank_in_group]
+
+    def sequence_parallel_combine(self, hidden_states, block_output, injection):
+        from .sm70_hc_prefill_peer import hc_sequence_combine_norm
+
+        separate = isinstance(block_output, tuple)
+        first, second = block_output if separate else (block_output, None)
+        hidden, _ = hc_sequence_combine_norm(
+            hidden_states,
+            first,
+            injection,
+            self.hc_norm.weight,
+            self.config.rms_norm_eps,
+            getattr(self, "_hcx_moe_payload", False) and not separate,
+            getattr(self, "_partial_inputs", False),
+            False,
+            second,
+        )
+        return hidden
+
+    def sequence_parallel_combine_and_mix(self, hidden_states, block_output, injection):
+        from .sm70_hc_prefill_peer import hc_sequence_combine_norm
+
+        separate = isinstance(block_output, tuple)
+        first, second = block_output if separate else (block_output, None)
+        hidden, normalized = hc_sequence_combine_norm(
+            hidden_states,
+            first,
+            injection,
+            self.hc_norm.weight,
+            self.config.rms_norm_eps,
+            getattr(self, "_hcx_moe_payload", False) and not separate,
+            getattr(self, "_partial_inputs", False),
+            True,
+            second,
+        )
+        block, next_injection = self._sequence_parallel_project(normalized)
+        return hidden, block, next_injection
+
+    def _partial_pair(self, block_output, expected_rows: int | None = None):
+        if isinstance(block_output, tuple):
+            return block_output
+        if getattr(self, "_hcx_moe_payload", False) or (
+            expected_rows is not None
+            and expected_rows > 0
+            and block_output.shape[0] == 2 * expected_rows
+        ):
+            rows = block_output.shape[0] // 2
+            return block_output[:rows], block_output[rows:]
+        return block_output, None
+
+    def _reduce_partial(
+        self, block_output: torch.Tensor, expected_rows: int | None = None
+    ) -> torch.Tensor:
+        if not getattr(self, "_partial_inputs", False):
+            return block_output
+        first, second = self._partial_pair(block_output, expected_rows)
+        if first.shape[0] > HCX_BATCH_M and not can_defer_ll_allreduce(first.shape[0]):
+            return first
+        if second is not None:
+            from vllm.distributed import tensor_model_parallel_all_reduce_sum2
+
+            return tensor_model_parallel_all_reduce_sum2(first, second)
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        return tensor_model_parallel_all_reduce(first)
+
+    def combine_and_mix(
+        self,
+        hidden_states: torch.Tensor,
+        prev_block_output: torch.Tensor,
+        prev_injection: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Consume a pending combine, then prepare the next block input.
+
+        ``hidden_states`` is the multi-stream state from before the pending
+        block's mix. Its combine with ``block_output`` is fused with this
+        module's input RMSNorm.
+        """
+        if getattr(self, "_partial_inputs", False):
+            if isinstance(prev_block_output, tuple):
+                first, second = prev_block_output
+                if second is not None:
+                    if not self.use_combine:
+                        hidden, block = torch.ops.vllm.qwen38_sm70_hcx_final_mix_pair(
+                            hidden_states, first, second, prev_injection, self._hcx_name
+                        )
+                        return hidden, block, None
+                    return torch.ops.vllm.qwen38_sm70_hcx_combine_and_mix_pair(
+                        hidden_states, first, second, prev_injection, self._hcx_name
+                    )
+                prev_block_output = first
+            if not self.use_combine:
+                hidden, block = torch.ops.vllm.qwen38_sm70_hcx_final_mix(
+                    hidden_states, prev_block_output, prev_injection, self._hcx_name
+                )
+                return hidden, block, None
+            return torch.ops.vllm.qwen38_sm70_hcx_combine_and_mix(
+                hidden_states, prev_block_output, prev_injection, self._hcx_name
+            )
+        prev_block_output = self._reduce_partial(prev_block_output)
+        return self._combine_and_mix_reduced(
+            hidden_states, prev_block_output, prev_injection
+        )
+
+    def _combine_and_mix_reduced(
+        self,
+        hidden_states: torch.Tensor,
+        prev_block_output: torch.Tensor,
+        prev_injection: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        hidden_states, xn = hc_combine_norm(
+            hidden_states,
+            prev_block_output,
+            prev_injection,
+            self.hc_norm.weight,
+            self.config.rms_norm_eps,
+            self.hc_count,
+        )
+
+        block_input, injection = self._project(xn)
+
+        return hidden_states, block_input, injection
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        block_output: torch.Tensor,
+        injection: torch.Tensor,
+    ) -> torch.Tensor:
+        if getattr(self, "_partial_inputs", False):
+            if isinstance(block_output, tuple):
+                first, second = block_output
+                if second is not None:
+                    return torch.ops.vllm.qwen38_sm70_hcx_combine_pair(
+                        hidden_states, first, second, injection, self._hcx_name
+                    )
+                block_output = first
+            return torch.ops.vllm.qwen38_sm70_hcx_combine(
+                hidden_states, block_output, injection, self._hcx_name
+            )
+        block_output = self._reduce_partial(block_output)
+        return hc_combine(hidden_states, block_output, injection, self.hc_count)
+
+    @property
+    def hyper_hidden_size(self) -> int:
+        return self.hc_count * self.hidden_size
+
+
+_PARTIAL_MODULES: dict[str, "GatedResidual"] = {}
+
+
+def _hcx_combine_and_mix(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    module = _PARTIAL_MODULES[name]
+    runtime = getattr(module, "_hcx", None)
+    oproj = getattr(module, "_hcx_oproj", None)
+    block_output, secondary = module._partial_pair(block_output, hidden_states.shape[0])
+    rows = block_output.shape[0]
+    if runtime is not None and 0 < rows <= HCX_BATCH_M:
+        # One launch; the kernel walks 8-row groups for concurrent batches.
+        diagnostic = (
+            {"snapshot_name": name} if getattr(runtime, "diagnostic", False) else {}
+        )
+        return runtime.run(
+            block_output,
+            hidden_states,
+            injection,
+            module.hc_norm.weight,
+            module.config.rms_norm_eps,
+            module._hcx_down,
+            module._hcx_up,
+            None if oproj is None else oproj[1:],
+            secondary=secondary,
+            **diagnostic,
+        )
+    if can_defer_ll_allreduce(rows):
+        comm = get_ll_allreduce_comm()
+        if comm is not None:
+            combined = comm.allreduce_combine_norm(
+                block_output.contiguous(),
+                None if secondary is None else secondary.contiguous(),
+                hidden_states,
+                injection,
+                module.hc_norm.weight,
+                module.config.rms_norm_eps,
+            )
+            if combined is not None:
+                hidden, xn = combined
+                block, inj = module._project(xn)
+                assert inj is not None
+                return hidden, block.contiguous(), inj.contiguous()
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    if oproj is not None and block_output.shape[0] <= HCX_BATCH_M:
+        # Deferred projection: the block output carries the o-proj input.
+        layer, k = oproj[0], oproj[1]
+        block_output, _ = layer(block_output[:, :k].contiguous())
+    reduced = block_output
+    if block_output.shape[0] <= HCX_BATCH_M or can_defer_ll_allreduce(
+        block_output.shape[0]
+    ):
+        if secondary is not None:
+            from vllm.distributed import tensor_model_parallel_all_reduce_sum2
+
+            reduced = tensor_model_parallel_all_reduce_sum2(block_output, secondary)
+        else:
+            reduced = tensor_model_parallel_all_reduce(block_output)
+    hidden, block, inj = module._combine_and_mix_reduced(
+        hidden_states, reduced, injection
+    )
+    assert inj is not None
+    # Match the fake's contiguous outputs. The original large-M injection
+    # is a view of the padded 336-column projection, with row stride 336.
+    return hidden.contiguous(), block.contiguous(), inj.contiguous()
+
+
+def _hcx_combine_and_mix_fake(hidden_states, block_output, injection, name):
+    m = hidden_states.shape[0]
+    return (
+        torch.empty_like(hidden_states),
+        block_output.new_empty((m, block_output.shape[1])),
+        injection.new_empty((m, injection.shape[1])),
+    )
+
+
+def _hcx_combine(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    # Keep the M-dependent TP reduction opaque to range compilation. The
+    # prefill trace can contain already-reduced payloads, whereas the same
+    # compiled range executes un-reduced small verification batches.
+    module = _PARTIAL_MODULES[name]
+    first, second = module._partial_pair(block_output, hidden_states.shape[0])
+    rows = first.shape[0]
+    if 0 < rows <= HCX_BATCH_M or can_defer_ll_allreduce(rows):
+        comm = get_ll_allreduce_comm()
+        if comm is not None:
+            out = comm.allreduce_combine(
+                first.contiguous(),
+                None if second is None else second.contiguous(),
+                hidden_states,
+                injection,
+            )
+            if out is not None:
+                return out
+    reduced = module._reduce_partial(block_output, hidden_states.shape[0])
+    return hc_combine(hidden_states, reduced, injection, module.hc_count)
+
+
+def _hcx_final_mix(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    module = _PARTIAL_MODULES[name]
+    first, second = module._partial_pair(block_output, hidden_states.shape[0])
+    rows = first.shape[0]
+    if 0 < rows <= HCX_BATCH_M or can_defer_ll_allreduce(rows):
+        comm = get_ll_allreduce_comm()
+        if comm is not None:
+            combined = comm.allreduce_combine_norm(
+                first.contiguous(),
+                None if second is None else second.contiguous(),
+                hidden_states,
+                injection,
+                module.hc_norm.weight,
+                module.config.rms_norm_eps,
+            )
+            if combined is not None:
+                hidden, xn = combined
+                block, _ = module._project(xn)
+                return hidden, block.contiguous()
+    reduced = module._reduce_partial(block_output, hidden_states.shape[0])
+    hidden, block, _ = module._combine_and_mix_reduced(
+        hidden_states, reduced, injection
+    )
+    return hidden.contiguous(), block.contiguous()
+
+
+def _hcx_combine_and_mix_pair(
+    hidden_states: torch.Tensor,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    module = _PARTIAL_MODULES[name]
+    runtime = getattr(module, "_hcx", None)
+    rows = first.shape[0]
+    if runtime is not None and 0 < rows <= HCX_BATCH_M:
+        diagnostic = (
+            {"snapshot_name": name} if getattr(runtime, "diagnostic", False) else {}
+        )
+        return runtime.run(
+            first,
+            hidden_states,
+            injection,
+            module.hc_norm.weight,
+            module.config.rms_norm_eps,
+            module._hcx_down,
+            module._hcx_up,
+            None,
+            secondary=second,
+            **diagnostic,
+        )
+    if can_defer_ll_allreduce(rows):
+        comm = get_ll_allreduce_comm()
+        if comm is not None:
+            combined = comm.allreduce_combine_norm(
+                first.contiguous(),
+                second.contiguous(),
+                hidden_states,
+                injection,
+                module.hc_norm.weight,
+                module.config.rms_norm_eps,
+            )
+            if combined is not None:
+                hidden, xn = combined
+                block, inj = module._project(xn)
+                assert inj is not None
+                return hidden, block.contiguous(), inj.contiguous()
+    from vllm.distributed import tensor_model_parallel_all_reduce_sum2
+
+    reduced = tensor_model_parallel_all_reduce_sum2(first, second)
+    hidden, block, inj = module._combine_and_mix_reduced(
+        hidden_states, reduced, injection
+    )
+    assert inj is not None
+    return hidden.contiguous(), block.contiguous(), inj.contiguous()
+
+
+def _hcx_combine_and_mix_pair_fake(hidden_states, first, second, injection, name):
+    m = hidden_states.shape[0]
+    return (
+        torch.empty_like(hidden_states),
+        first.new_empty((m, first.shape[1])),
+        injection.new_empty((m, injection.shape[1])),
+    )
+
+
+def _hcx_combine_pair(
+    hidden_states: torch.Tensor,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    module = _PARTIAL_MODULES[name]
+    rows = first.shape[0]
+    if 0 < rows <= HCX_BATCH_M or can_defer_ll_allreduce(rows):
+        comm = get_ll_allreduce_comm()
+        if comm is not None:
+            out = comm.allreduce_combine(
+                first.contiguous(),
+                second.contiguous(),
+                hidden_states,
+                injection,
+            )
+            if out is not None:
+                return out
+    from vllm.distributed import tensor_model_parallel_all_reduce_sum2
+
+    reduced = tensor_model_parallel_all_reduce_sum2(first, second)
+    return hc_combine(hidden_states, reduced, injection, module.hc_count)
+
+
+def _hcx_final_mix_pair(
+    hidden_states: torch.Tensor,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    module = _PARTIAL_MODULES[name]
+    rows = first.shape[0]
+    if 0 < rows <= HCX_BATCH_M or can_defer_ll_allreduce(rows):
+        comm = get_ll_allreduce_comm()
+        if comm is not None:
+            combined = comm.allreduce_combine_norm(
+                first.contiguous(),
+                second.contiguous(),
+                hidden_states,
+                injection,
+                module.hc_norm.weight,
+                module.config.rms_norm_eps,
+            )
+            if combined is not None:
+                hidden, xn = combined
+                block, _ = module._project(xn)
+                return hidden, block.contiguous()
+    from vllm.distributed import tensor_model_parallel_all_reduce_sum2
+
+    reduced = tensor_model_parallel_all_reduce_sum2(first, second)
+    hidden, block, _ = module._combine_and_mix_reduced(
+        hidden_states, reduced, injection
+    )
+    return hidden.contiguous(), block.contiguous()
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_final_mix",
+    op_func=_hcx_final_mix,
+    fake_impl=lambda hidden_states, block_output, injection, name: (
+        torch.empty_like(hidden_states),
+        block_output.new_empty((hidden_states.shape[0], block_output.shape[1])),
+    ),
+)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_final_mix_pair",
+    op_func=_hcx_final_mix_pair,
+    fake_impl=lambda hidden_states, first, second, injection, name: (
+        torch.empty_like(hidden_states),
+        first.new_empty((hidden_states.shape[0], first.shape[1])),
+    ),
+)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_combine",
+    op_func=_hcx_combine,
+    fake_impl=lambda hidden_states, block_output, injection, name: torch.empty_like(
+        hidden_states
+    ),
+)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_combine_pair",
+    op_func=_hcx_combine_pair,
+    fake_impl=lambda hidden_states, first, second, injection, name: torch.empty_like(
+        hidden_states
+    ),
+)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_combine_and_mix",
+    op_func=_hcx_combine_and_mix,
+    fake_impl=_hcx_combine_and_mix_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_combine_and_mix_pair",
+    op_func=_hcx_combine_and_mix_pair,
+    fake_impl=_hcx_combine_and_mix_pair_fake,
+)
+
+__all__ = [
+    "GatedResidual",
+    "GroupedGemmaRMSNorm",
+    "HyperConnectionConfig",
+]

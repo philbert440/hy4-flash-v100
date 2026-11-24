@@ -1,0 +1,631 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Device-side compact/reference dispatch for uniform DFlash2 verifier batches."""
+
+from copy import copy
+from typing import Any
+
+import numpy as np
+import torch
+import torch.distributed as dist
+
+from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.distributed.parallel_state import graph_capture
+from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
+from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    dflash2_sparse_topk_rejection_sample,
+    rejection_sample,
+)
+
+logger = init_logger(__name__)
+
+ROWS_PER_REQUEST = 8
+# Up to 4 requests share one (prefix, reference, compact) CUDA graph memory
+# pool triple (~170 MiB total when captured from max_reqs down to 1).
+MAX_GRAPH_REQUESTS = 4
+MAX_GRAPHS = 32
+# Capture allocates outside the budget. Serving still needs room after it: the
+# host-decision path at c8 reserves about 1.3 GiB on top of the idle footprint.
+CAPTURE_HEADROOM_BYTES = 5 << 29
+
+
+@triton.jit
+def _prepare_hidden(
+    hidden,
+    fixed_hidden,
+    dense,
+    dense_pointer,
+    hidden_size: tl.constexpr,
+    block: tl.constexpr,
+):
+    offsets = tl.program_id(0) * block + tl.arange(0, block)
+    tl.store(
+        fixed_hidden + offsets,
+        tl.load(hidden + offsets, offsets < hidden_size, 0),
+        offsets < hidden_size,
+    )
+    if tl.program_id(0) == 0:
+        tl.store(dense_pointer, dense.to(tl.int64))
+
+
+@triton.jit
+def _prepare_request(
+    inputs,
+    fixed_inputs,
+    positions,
+    fixed_positions,
+    source_mapping,
+    mapping,
+    expanded,
+    ids,
+    fixed_ids,
+    values,
+    fixed_values,
+    sparse_size: tl.constexpr,
+    source_sparse_stride: tl.constexpr,
+    fixed_sparse_stride: tl.constexpr,
+    rows: tl.constexpr,
+    block: tl.constexpr,
+):
+    index = tl.program_id(0)
+    request = tl.load(source_mapping + index)
+    offsets = tl.arange(0, block)
+    first = index * rows
+    tl.store(
+        fixed_ids + request * fixed_sparse_stride + offsets,
+        tl.load(
+            ids + request * source_sparse_stride + offsets, offsets < sparse_size, 0
+        ),
+        offsets < sparse_size,
+    )
+    tl.store(
+        fixed_values + request * fixed_sparse_stride + offsets,
+        tl.load(
+            values + request * source_sparse_stride + offsets, offsets < sparse_size, 0
+        ),
+        offsets < sparse_size,
+    )
+    tl.store(mapping + index, request)
+    tl.store(expanded + first + offsets, request, offsets < rows)
+    tl.store(
+        fixed_inputs + first + offsets,
+        tl.load(inputs + first + offsets, offsets < rows, 0),
+        offsets < rows,
+    )
+    tl.store(
+        fixed_positions + first + offsets,
+        tl.load(positions + first + offsets, offsets < rows, 0),
+        offsets < rows,
+    )
+
+
+@triton.jit
+def _copy_dense_slot(
+    source_pointer,
+    destination,
+    mapping,
+    destination_stride: tl.constexpr,
+    slot_size: tl.constexpr,
+    block: tl.constexpr,
+):
+    # The source address is refreshed with the current request's inputs.
+    # Only the reference branch reads dense proposals; compact rounds incur
+    # no full-vocabulary copy, and inactive request slots are never copied.
+    source = tl.load(source_pointer).to(destination.dtype)
+    request = tl.load(mapping + tl.program_id(0))
+    offsets = tl.program_id(1) * block + tl.arange(0, block)
+    values = tl.load(source + request * slot_size + offsets, offsets < slot_size, 0)
+    tl.store(
+        destination + request * destination_stride + offsets,
+        values,
+        offsets < slot_size,
+    )
+
+
+def _capture_headroom(device: torch.device) -> bool:
+    free, _ = torch.cuda.mem_get_info(device)
+    idle = torch.accelerator.memory_reserved(device) - (
+        torch.accelerator.memory_allocated(device)
+    )
+    return free + idle >= CAPTURE_HEADROOM_BYTES
+
+
+def _all_ranks_support(status: int) -> bool:
+    # Capability disagreement must select the existing sampler on every rank.
+    # This is a capture-time CPU collective, never a per-round GPU fence.
+    with torch.inference_mode(False):
+        unsupported = torch.tensor(int(status != 0), dtype=torch.int32)
+        dist.all_reduce(
+            unsupported, op=dist.ReduceOp.MAX, group=get_tp_group().cpu_group
+        )
+    return unsupported.item() == 0
+
+
+def _snapshot_sampling_inputs(
+    sampler: Any,
+) -> tuple[Any, list[tuple[Any, torch.Tensor]]]:
+    """Give this graph fixed addresses without changing eager sampling state."""
+    view = copy(sampler)
+    copies: list[tuple[Any, torch.Tensor]] = []
+    for state_name, names in (
+        ("sampling_states", ("temperature", "top_k", "top_p", "min_p", "seeds")),
+        (
+            "penalties_state",
+            ("repetition_penalty", "frequency_penalty", "presence_penalty"),
+        ),
+    ):
+        source_state = getattr(sampler, state_name)
+        state = copy(source_state)
+        for name in names:
+            source = getattr(source_state, name, None)
+            if source is None:
+                continue
+            tensor = source.gpu.clone()
+            field = copy(source)
+            field.gpu = tensor
+            setattr(state, name, field)
+            copies.append((source, tensor))
+        setattr(view, state_name, state)
+    return view, copies
+
+
+class _RejectionGraph:
+    def __init__(self, model, speculator, rejection, hidden, batch, sparse, penalties):
+        self.requests = batch.num_reqs
+        # Penalties are a trace constant: graphs without them launch no kernel.
+        self.penalties = penalties
+        rows = self.requests * ROWS_PER_REQUEST
+        self.hidden = torch.empty_like(hidden)
+        self.inputs = torch.empty_like(batch.input_ids[:rows])
+        self.positions = torch.empty_like(batch.positions[:rows])
+        # MRv2 allocates expanded metadata anew every round. Keep graph inputs
+        # independent of those allocations and preserve the original slot ID.
+        self.mapping = batch.idx_mapping[: self.requests].clone()
+        self.expanded = batch.expanded_idx_mapping[:rows].clone()
+        self.local = torch.arange(
+            ROWS_PER_REQUEST,
+            dtype=batch.expanded_local_pos.dtype,
+            device=hidden.device,
+        ).repeat(self.requests)
+        self.cu = batch.cu_num_logits[: self.requests + 1].clone()
+        self.request_indices = batch.idx_mapping_np.copy()
+        self.rejection = rejection
+        self.sampler, self._parameter_copies = _snapshot_sampling_inputs(
+            rejection.sampler
+        )
+        self.model = model
+        self.speculator = speculator
+        self.sparse = tuple(torch.empty_like(t) for t in sparse)
+        dense = speculator.draft_logits
+        if self.requests == 1:
+            # Alias the one private proposal slot for every state index while
+            # preserving the original request mapping. Dense kernels accept
+            # stride(0)==0; no other request slot is read.
+            self.draft_slot = dense.new_empty((1, *dense.shape[1:]))
+            self.draft_logits = self.draft_slot.expand(dense.shape[0], -1, -1)
+        else:
+            # Every replay refills the slots it reads, so graphs can share this.
+            shared = getattr(rejection, "_sm70_dflash2_graph_draft_logits", None)
+            if shared is None or shared.shape != dense.shape:
+                shared = dense.new_empty(dense.shape)
+                rejection._sm70_dflash2_graph_draft_logits = shared
+            self.draft_logits = shared
+        self.dense_pointer = self.inputs.new_empty(1, dtype=torch.int64)
+        self.output = self.inputs.new_empty(
+            (self.requests, ROWS_PER_REQUEST), dtype=torch.int64
+        )
+        self.count = self.inputs.new_empty(self.requests, dtype=torch.int32)
+        self.counters = self.inputs.new_zeros(2, dtype=torch.int64)
+        self.request_id = None
+        pools = getattr(rejection, "_sm70_dflash2_graph_pools", None)
+        if pools is None:
+            pools = tuple(torch.cuda.graph_pool_handle() for _ in range(3))
+            rejection._sm70_dflash2_graph_pools = pools
+        self.pools = pools
+        self.ids: torch.Tensor | None = None
+        self.values: torch.Tensor | None = None
+        self.fallback: Any = None
+        self.prefix = torch.cuda.CUDAGraph(keep_graph=True)
+        self.reference = torch.cuda.CUDAGraph(keep_graph=True)
+        self.compact = torch.cuda.CUDAGraph(keep_graph=True)
+        self.sampler.sampling_states.capture_mode = True
+        self.prepare(hidden, batch, sparse)
+
+    def _clear_transient(self) -> None:
+        self.ids = None
+        self.values = None
+        self.fallback = None
+
+    def prepare(self, hidden, batch, sparse):
+        # UVA pools rotate their GPU aliases. Refresh fixed graph-owned tensors
+        # on the consumer stream, including parameters indexed by high slots.
+        for source, tensor in self._parameter_copies:
+            tensor.copy_(source.gpu)
+        self.cu.copy_(batch.cu_num_logits[: self.requests + 1])
+        ids, values = sparse
+        fixed_ids, fixed_values = self.sparse
+        _prepare_hidden[(triton.cdiv(hidden.numel(), 1024),)](
+            hidden,
+            self.hidden,
+            self.speculator.draft_logits,
+            self.dense_pointer,
+            hidden.numel(),
+            1024,
+            num_warps=4,
+        )
+        _prepare_request[(self.requests,)](
+            batch.input_ids,
+            self.inputs,
+            batch.positions,
+            self.positions,
+            batch.idx_mapping,
+            self.mapping,
+            self.expanded,
+            ids,
+            fixed_ids,
+            values,
+            fixed_values,
+            ids.shape[1] * ids.shape[2],
+            ids.stride(0),
+            fixed_ids.stride(0),
+            ROWS_PER_REQUEST,
+            triton.next_power_of_2(ids.shape[1] * ids.shape[2]),
+            num_warps=1,
+        )
+        # Dense proposals are accessed indirectly inside a conditional body.
+        # Record their consumer stream for replaced/eager tensor lifetimes.
+        self.speculator.draft_logits.record_stream(torch.cuda.current_stream())
+
+    def _probe(self):
+        from .sparse_rejection import _compact_target_reference_flags, _penalize_probe
+
+        probe = getattr(
+            self.model,
+            "get_compact_target_probe_with_fallback",
+            self.model.get_topk_tokens_and_logits_with_fallback,
+        )
+        self.ids, self.values, self.fallback = probe(self.hidden, 64)
+        if self.fallback is None:
+            return False
+        sampler = self.sampler
+        states = sampler.sampling_states
+        floors = None
+        if self.penalties:
+            floors = _penalize_probe(
+                self.values,
+                self.ids,
+                sampler.penalties_state,
+                self.expanded,
+                self.inputs,
+                self.local,
+            )
+        self.values, self.ids = sort_topk_with_vocab_ties(
+            self.values, self.ids, vocab_size=states.vocab_size, descending=True
+        )
+        self.flags = _compact_target_reference_flags(
+            self.values, states.temperature.gpu, states.top_p.gpu, self.expanded, floors
+        )
+        return True
+
+    def _dense(self):
+        slot_size = self.draft_logits.shape[1] * self.draft_logits.shape[2]
+        _copy_dense_slot[(self.requests, triton.cdiv(slot_size, 4096))](
+            self.dense_pointer,
+            self.draft_logits,
+            self.mapping,
+            self.draft_logits.stride(0),
+            slot_size,
+            4096,
+            num_warps=4,
+        )
+        logits = self.fallback()
+        if logits is None:
+            raise RuntimeError("DFlash2 graph rejection requires replicated logits")
+        sampler = self.sampler
+        states = sampler.sampling_states
+        processed = sampler.apply_sampling_params(
+            logits,
+            self.expanded,
+            self.request_indices,
+            self.positions,
+            self.inputs,
+            self.local,
+        )
+        output, count = rejection_sample(
+            processed,
+            self.draft_logits,
+            self.inputs,
+            self.cu,
+            self.positions,
+            self.mapping,
+            self.expanded,
+            self.local,
+            states.temperature.gpu,
+            states.seeds.gpu,
+            self.rejection.num_speculative_steps,
+            use_fp64=sampler.use_fp64_gumbel,
+        )
+        self.output.copy_(output)
+        self.count.copy_(count)
+
+    def _compact(self):
+        sampler = self.sampler
+        states = sampler.sampling_states
+        ids, values = self.sparse
+        output, count = dflash2_sparse_topk_rejection_sample(
+            self.ids,
+            self.values,
+            ids,
+            values,
+            self.inputs,
+            self.cu,
+            self.positions,
+            self.mapping,
+            states.temperature.gpu,
+            states.top_p.gpu,
+            states.seeds.gpu,
+            self.rejection.num_speculative_steps,
+            use_fp64=sampler.use_fp64_gumbel,
+            target_top_k=20,
+        )
+        self.output.copy_(output)
+        self.count.copy_(count)
+
+    def capture(self):
+        # Sampling is stateless in seed/position. Warmup writes only the private
+        # outputs and does not advance request state or proposal random streams.
+        pool_prefix, pool_reference, pool_compact = self.pools
+        with graph_capture(device=self.hidden.device):
+            if not _all_ranks_support(0 if self._probe() else 801):
+                self._clear_transient()
+                return False
+            self._dense()
+            self._compact()
+            self._clear_transient()
+            torch.accelerator.synchronize(self.hidden.device)
+            torch.accelerator.empty_cache()
+            with torch.cuda.graph(self.prefix, pool=pool_prefix):
+                self._probe()
+            with torch.cuda.graph(self.reference, pool=pool_reference):
+                self._dense()
+            with torch.cuda.graph(self.compact, pool=pool_compact):
+                self._compact()
+            self._clear_transient()
+        status = torch.ops._C.sm70_sampler_graph_prepare_collective(
+            self.flags, self.reference.raw_cuda_graph()
+        )
+        if not _all_ranks_support(status):
+            return False
+        status = torch.ops._C.sm70_sampler_graph_attach_branch(
+            self.flags,
+            self.prefix.raw_cuda_graph(),
+            self.reference.raw_cuda_graph(),
+            self.compact.raw_cuda_graph(),
+            self.counters,
+        )
+        if not _all_ranks_support(status):
+            return False
+        status = 0
+        try:
+            self.prefix.instantiate()
+        except RuntimeError as error:
+            logger.debug("CUDA rejected a DFlash2 sampler graph: %s", error)
+            status = 801
+        return _all_ranks_support(status)
+
+    def replay(self, hidden, batch, sparse):
+        request_id = tuple(batch.req_ids)
+        if request_id != self.request_id:
+            self.counters.zero_()
+            self.request_id = request_id
+        self.prepare(hidden, batch, sparse)
+        self.prefix.replay()
+        # AsyncOutput copies on another stream. Give it independent storage so
+        # the next graph replay cannot overwrite a still-pending output copy.
+        return SamplerOutput(
+            sampled_token_ids=self.output.clone(),
+            num_sampled=self.count.clone(),
+            logprobs_tensors=None,
+            num_nans=None,
+        )
+
+
+def try_graph_rejection(
+    model: Any,
+    speculator: Any,
+    rejection: Any,
+    hidden: torch.Tensor,
+    batch: Any,
+    sparse: tuple[torch.Tensor, torch.Tensor],
+    *,
+    pre_capture_only: bool = False,
+) -> SamplerOutput | None:
+    """Caller has checked the positive-temperature compact sampling contract."""
+    if (
+        not 1 <= getattr(batch, "num_reqs", 0) <= MAX_GRAPH_REQUESTS
+        or batch.num_tokens != batch.num_reqs * ROWS_PER_REQUEST
+        or hidden.shape[0] != batch.num_reqs * ROWS_PER_REQUEST
+        or rejection.num_speculative_steps != ROWS_PER_REQUEST - 1
+        or not np.array_equal(
+            batch.cu_num_logits_np,
+            np.arange(batch.num_reqs + 1) * ROWS_PER_REQUEST,
+        )
+        or get_tensor_model_parallel_world_size() != 4
+        or not hasattr(model, "get_topk_tokens_and_logits_with_fallback")
+        or not hasattr(torch.ops._C, "sm70_sampler_graph_prepare_collective")
+        or rejection.sampler.sampling_states.vocab_size < 32768
+        or not all(
+            t.is_contiguous() for t in (hidden, speculator.draft_logits, *sparse)
+        )
+        or sparse[0].stride(0) != sparse[1].stride(0)
+    ):
+        return None
+    rows = batch.num_reqs * ROWS_PER_REQUEST
+    states = rejection.sampler.sampling_states
+    idx = batch.idx_mapping_np
+    penalties = bool(np.any(rejection.sampler.penalties_state.use_penalty[idx]))
+    # CPU dispatch choices are trace constants; numeric parameters and request
+    # slots remain live GPU inputs. Private input storage makes cache decisions
+    # independent of the allocator and the target graph's output lifetime.
+    tensors = (
+        hidden,
+        batch.input_ids[:rows],
+        batch.positions[:rows],
+        speculator.draft_logits,
+        *sparse,
+    )
+    key = (
+        id(model),
+        id(speculator),
+        hidden.dtype,
+        bool(np.any(states.top_p.np[idx] != 1.0)),
+        rejection.sampler.use_fp64_gumbel,
+        penalties,
+        tuple((t.dtype, tuple(t.shape), tuple(t.stride())) for t in tensors),
+    )
+    graphs = getattr(rejection, "_sm70_dflash2_rejection_graphs", None)
+    if graphs is None:
+        graphs = rejection._sm70_dflash2_rejection_graphs = {}
+    if key not in graphs:
+        if len(graphs) >= MAX_GRAPHS:
+            # Bound graph storage for unexpected shape/contract combinations.
+            return None
+        if not _all_ranks_support(0 if _capture_headroom(hidden.device) else 801):
+            graphs[key] = None
+            return None
+        candidate = _RejectionGraph(
+            model, speculator, rejection, hidden, batch, sparse, penalties
+        )
+        graphs[key] = candidate if candidate.capture() else None
+    graph = graphs[key]
+    if graph is None or pre_capture_only:
+        return None
+    rejection.sm70_dflash2_reference_counts = graph.counters
+    logger.info_once(
+        "DFlash2 compact/reference rejection uses device-side graph dispatch."
+    )
+    return graph.replay(hidden, batch, sparse)
+
+
+@torch.inference_mode()
+def pre_capture_dflash2_sampler_graphs(
+    model: Any,
+    speculator: Any,
+    rejection: Any,
+) -> None:
+    """Pre-capture DFlash2 compact/reference sampler graphs during startup."""
+    from types import SimpleNamespace
+
+    sparse = speculator.get_sparse_draft_logits()
+    if (
+        rejection is None
+        or sparse is None
+        or speculator.draft_logits is None
+        or speculator.device.type != "cuda"
+        or torch.cuda.get_device_capability(speculator.device) != (7, 0)
+        or int(rejection.num_speculative_steps) != ROWS_PER_REQUEST - 1
+        or get_tensor_model_parallel_world_size() != 4
+        or not hasattr(model, "get_topk_tokens_and_logits_with_fallback")
+        or not hasattr(torch.ops._C, "sm70_sampler_graph_prepare_collective")
+    ):
+        return
+
+    device = speculator.device
+    states = rejection.sampler.sampling_states
+    penalties = rejection.sampler.penalties_state
+    vocab_size = int(getattr(states, "vocab_size", 0))
+    max_reqs = min(
+        MAX_GRAPH_REQUESTS,
+        int(getattr(speculator, "max_num_reqs", 0)),
+        int(getattr(states, "max_num_reqs", 0)),
+    )
+    if max_reqs < 1 or vocab_size < 32768:
+        return
+
+    hidden_size = int(speculator.vllm_config.model_config.get_hidden_size())
+    dtype = speculator.vllm_config.model_config.dtype
+    input_buffers = getattr(speculator, "input_buffers", None)
+
+    saved_temp = states.temperature.np[:max_reqs].copy()
+    saved_top_k = states.top_k.np[:max_reqs].copy()
+    saved_top_p = states.top_p.np[:max_reqs].copy()
+    saved_min_p = states.min_p.np[:max_reqs].copy()
+    saved_seeds = states.seeds.np[:max_reqs].copy()
+    saved_pres = penalties.presence_penalty.np[:max_reqs].copy()
+    saved_use_pen = penalties.use_penalty[:max_reqs].copy()
+    try:
+        for use_pen, temp, top_p, pres in (
+            (False, 1.0, 0.95, 0.0),
+            (True, 0.7, 0.80, 1.5),
+            (False, 1.0, 1.0, 0.0),
+            (True, 0.7, 1.0, 1.5),
+        ):
+            states.temperature.np[:max_reqs] = temp
+            states.top_k.np[:max_reqs] = 20
+            states.top_p.np[:max_reqs] = top_p
+            states.min_p.np[:max_reqs] = 0.0
+            states.seeds.np[:max_reqs] = 2026
+            states.apply_staged_writes()
+            penalties.presence_penalty.np[:max_reqs] = pres
+            penalties.presence_penalty.copy_to_uva()
+            penalties.use_penalty[:max_reqs] = use_pen
+
+            # Capture from largest batch down to 1 so the shared pools allocate
+            # the high-water mark once and smaller batches reuse the same blocks.
+            for requests in range(max_reqs, 0, -1):
+                rows = requests * ROWS_PER_REQUEST
+                if (
+                    input_buffers is not None
+                    and input_buffers.input_ids.shape[0] >= rows
+                    and input_buffers.positions.shape[0] >= rows
+                ):
+                    input_ids = input_buffers.input_ids[:rows]
+                    positions = input_buffers.positions[:rows]
+                else:
+                    input_ids = torch.zeros(rows, dtype=torch.int32, device=device)
+                    positions = torch.zeros(rows, dtype=torch.int64, device=device)
+                mapping_np = np.arange(requests, dtype=np.int32)
+                mapping = torch.arange(requests, dtype=torch.int32, device=device)
+                cu_np = np.arange(requests + 1, dtype=np.int32) * ROWS_PER_REQUEST
+                dummy_batch = SimpleNamespace(
+                    num_reqs=requests,
+                    num_tokens=rows,
+                    req_ids=[f"_sm70_dflash2_warmup_{r}" for r in range(requests)],
+                    idx_mapping_np=mapping_np,
+                    idx_mapping=mapping,
+                    expanded_idx_mapping=mapping.repeat_interleave(ROWS_PER_REQUEST),
+                    expanded_local_pos=torch.arange(
+                        ROWS_PER_REQUEST, dtype=torch.int32, device=device
+                    ).repeat(requests),
+                    input_ids=input_ids,
+                    positions=positions,
+                    cu_num_logits_np=cu_np,
+                    cu_num_logits=torch.tensor(cu_np, dtype=torch.int32, device=device),
+                )
+                dummy_hidden = torch.zeros(
+                    (rows, hidden_size), dtype=dtype, device=device
+                )
+                try_graph_rejection(
+                    model,
+                    speculator,
+                    rejection,
+                    dummy_hidden,
+                    dummy_batch,
+                    sparse,
+                    pre_capture_only=True,
+                )
+    finally:
+        states.temperature.np[:max_reqs] = saved_temp
+        states.top_k.np[:max_reqs] = saved_top_k
+        states.top_p.np[:max_reqs] = saved_top_p
+        states.min_p.np[:max_reqs] = saved_min_p
+        states.seeds.np[:max_reqs] = saved_seeds
+        states.apply_staged_writes()
+        penalties.presence_penalty.np[:max_reqs] = saved_pres
+        penalties.presence_penalty.copy_to_uva()
+        penalties.use_penalty[:max_reqs] = saved_use_pen
+        torch.accelerator.synchronize(device)
+        torch.accelerator.empty_cache()

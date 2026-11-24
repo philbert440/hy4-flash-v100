@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""MRV2 warmup must reserve the same speculative KV tail as the scheduler."""
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import torch
+
+from vllm.config.speculative import SpeculativeConfig
+from vllm.config.vllm import VllmConfig
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.worker.gpu.warmup import (
+    _kernel_prefill_warmup_token_counts,
+    _reserved_block_count,
+    warmup_kernels,
+)
+
+BLOCK_SIZE = 16
+MAX_MODEL_LEN = 1024
+NUM_SPEC_TOKENS = 7
+
+
+def test_kernel_prefill_warmup_profiles_are_capability_advertised() -> None:
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128),
+        max_model_len=64,
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "plain": object(),
+                "qsa_0": SimpleNamespace(
+                    kernel_warmup_prefill_token_counts=(33, 257, True, -1)
+                ),
+                "qsa_1": SimpleNamespace(kernel_warmup_prefill_token_counts=(33,)),
+            }
+        ),
+    )
+
+    assert _kernel_prefill_warmup_token_counts(runner, 6) == (6, 33)
+
+
+def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector_states: list[bool] = []
+    attention_spec = _full_attention_spec()
+    runner = SimpleNamespace(
+        num_speculative_steps=4,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=4,
+            max_num_batched_tokens=128,
+        ),
+        max_model_len=64,
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "profile": SimpleNamespace(kernel_warmup_prefill_token_counts=(33,))
+            }
+        ),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=attention_spec)],
+            num_blocks=64,
+        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=4),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(
+            set_disabled=lambda disabled: connector_states.append(disabled)
+        ),
+    )
+    executions: list[Any] = []
+    samples: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(runner, executions.append, samples.append)
+
+    tokens = [output.total_num_scheduled_tokens for output in executions]
+    # Full batch, then the 33-token kernel profile and a full prefill chunk
+    # (capped so the decode step fits max_model_len), one request each.
+    assert tokens[:9] == [24, 20, 0, 33, 5, 0, 59, 5, 0]
+    # Every smaller request count: a pure decode step, then a decode step
+    # that also admits a 6-token prefill.
+    assert tokens[9:] == [
+        *(18, 15, 0, 18, 21, 0),
+        *(12, 10, 0, 12, 16, 0),
+        *(6, 5, 0, 6, 11, 0),
+    ]
+    mixed = [output for output in executions if output.scheduled_new_reqs][-1]
+    assert len(mixed.scheduled_cached_reqs.req_ids) == 1
+    assert [r.req_id for r in mixed.scheduled_new_reqs] == ["_warmup_c1m_new_"]
+    # Every request a cycle starts is finished by its cleanup step.
+    started = {r.req_id for output in executions for r in output.scheduled_new_reqs}
+    finished = set().union(*(output.finished_req_ids for output in executions))
+    assert started == finished
+    assert connector_states == [True, False]
+    assert len(samples) == 6 + 6 * 2
+    # Only the short prompts ask for prompt logprobs: on the kernel profile and
+    # the full chunk they would build logits for every prompt token.
+    prompt_logprobs = [
+        {r.sampling_params.prompt_logprobs for r in output.scheduled_new_reqs}
+        for output in executions
+        if output.scheduled_new_reqs
+    ]
+    assert prompt_logprobs[:3] == [{1}, {None}, {None}]
+    assert all(entry == {1} for entry in prompt_logprobs[3:])
+
+
+def _speculative_config(method: str) -> SpeculativeConfig:
+    config = object.__new__(SpeculativeConfig)
+    object.__setattr__(config, "method", method)
+    object.__setattr__(config, "num_speculative_tokens", NUM_SPEC_TOKENS)
+    object.__setattr__(config, "ddtree_disable_tree_verify", False)
+    object.__setattr__(config, "ddtree_budget", 24)
+    return config
+
+
+class _Config:
+    speculative_config: SpeculativeConfig | None = None
+    diffusion_config = None
+    num_speculative_tokens = VllmConfig.num_speculative_tokens
+    num_lookahead_tokens = VllmConfig.num_lookahead_tokens
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("dflash", NUM_SPEC_TOKENS + 1),
+        ("dflash_ddtree", 25),
+        ("eagle3", NUM_SPEC_TOKENS),
+        ("mtp", NUM_SPEC_TOKENS),
+        ("dspark", NUM_SPEC_TOKENS),
+        ("draft_model", NUM_SPEC_TOKENS),
+        ("ngram", 0),
+    ],
+)
+def test_num_lookahead_tokens_per_method(method: str, expected: int) -> None:
+    config = _Config()
+    config.speculative_config = _speculative_config(method)
+
+    assert config.num_lookahead_tokens == expected
+
+
+def test_num_lookahead_tokens_without_speculation() -> None:
+    assert _Config().num_lookahead_tokens == 0
+
+
+def _full_attention_spec() -> FullAttentionSpec:
+    return FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+    )
+
+
+def _mamba_spec(mode: str) -> MambaSpec:
+    return MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode=mode,
+        num_speculative_blocks=NUM_SPEC_TOKENS,
+    )
+
+
+def _circular_spec() -> CircularBufferSpec:
+    return CircularBufferSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        (_full_attention_spec(), 2),
+        (_circular_spec(), 1),
+        (
+            UniformTypeKVCacheSpecs(
+                block_size=4, kv_cache_specs={"compressor_state": _circular_spec()}
+            ),
+            1,
+        ),
+        (_mamba_spec("align"), 8),
+        (_mamba_spec("none"), 9),
+        (_mamba_spec("all"), 9),
+    ],
+)
+def test_reserved_block_count_matches_speculative_tail(spec, expected) -> None:
+    # 14 scheduled tokens plus DFlash's eight lookahead positions crosses the
+    # second attention block. Align-mode Mamba excludes lookahead from its
+    # token range but always retains seven speculative state blocks.
+    assert (
+        _reserved_block_count(
+            14,
+            spec,
+            num_lookahead_tokens=NUM_SPEC_TOKENS + 1,
+            max_model_len=MAX_MODEL_LEN,
+            max_encoder_len=0,
+        )
+        == expected
+    )
+
+
+def test_warmup_keeps_state_groups_inside_a_bounded_state_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1490: a bounded host-KV state pool sizes the recurrent-state tensors to
+    # ``device_state_blocks``; warmup handed them sequential IDs past it.
+    state_blocks = 6
+    runner = SimpleNamespace(
+        num_speculative_steps=4,
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=256),
+        max_model_len=512,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=_mamba_spec("align")),
+                SimpleNamespace(kv_cache_spec=_full_attention_spec()),
+                SimpleNamespace(kv_cache_spec=_mamba_spec("align")),
+            ],
+            num_blocks=400,
+            device_state_blocks=state_blocks,
+            device_state_group_ids=(0, 2),
+        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=4),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+    )
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(runner, executions.append, lambda *_: None)
+
+    groups: list[tuple[list[int], ...]] = [
+        req.block_ids for output in executions for req in output.scheduled_new_reqs
+    ]
+    groups += [
+        ids
+        for output in executions
+        for ids in output.scheduled_cached_reqs.new_block_ids
+        if ids is not None
+    ]
+    assert groups
+    for block_ids in groups:
+        for group_id, ids in enumerate(block_ids):
+            if group_id in (0, 2):
+                assert all(1 <= i < state_blocks for i in ids), ids
+            else:
+                assert all(state_blocks <= i < 400 for i in ids), ids

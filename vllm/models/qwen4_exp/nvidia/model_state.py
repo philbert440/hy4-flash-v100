@@ -1,0 +1,266 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Model-runner state for Qwen4Exp PLE inputs."""
+
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+from vllm.platforms import current_platform
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.ple_offload.protocol import PleCpuInputs
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+from vllm.v1.worker.gpu.states import RequestState
+
+logger = init_logger(__name__)
+
+
+class Qwen4ExpModelState(MambaHybridModelState):
+    """Add rollback-safe PLE n-gram context to the model inputs."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ) -> None:
+        super().__init__(vllm_config, model, encoder_cache, device)
+        config = self.model_config.hf_text_config
+        self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        # Host copies of each request's prefill tokens for early PLE requests.
+        # all_token_ids is written by a GPU kernel, so its host view may still
+        # lag behind the previous forward.
+        self._ple_early_tokens: dict[int, np.ndarray] | None = (
+            {}
+            if self.uses_ngram_embedding
+            and vllm_config.kernel_config.ple_prefill_early_request
+            else None
+        )
+        if not self.uses_ngram_embedding:
+            self.ngram_context_len = 0
+            self.ngram_eos_token_id = 0
+            return
+
+        check_ple_layers_on_first_pp_rank(
+            config, vllm_config.parallel_config.pipeline_parallel_size
+        )
+
+        self.ngram_context_len = int(config.ngram_size) - 1
+        if self.ngram_context_len <= 0:
+            raise ValueError("N-gram embedding requires context length >= 1.")
+        self.ngram_eos_token_id = int(config.eos_token_id)
+        self.ngram_context = torch.full(
+            (self.max_num_reqs, self.ngram_context_len),
+            self.ngram_eos_token_id,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.ngram_context_offsets = torch.arange(
+            -self.ngram_context_len,
+            0,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.ple_query_start_loc = torch.zeros(
+            self.max_num_reqs + 1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._ple_kernel_config = vllm_config.kernel_config
+        self._ple_input_hardware = current_platform.is_device_capability(70)
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        if self._ple_early_tokens is None:
+            return
+        if new_req_data.prompt_embeds is not None:
+            self._ple_early_tokens.pop(req_index, None)
+            return
+        assert new_req_data.prefill_token_ids is not None
+        self._ple_early_tokens[req_index] = np.asarray(
+            new_req_data.prefill_token_ids, dtype=np.int32
+        )
+
+    def ple_cpu_inputs(self, input_batch: InputBatch) -> PleCpuInputs | None:
+        """Build a prompt-only batch's PLE inputs on the host, else None.
+
+        Mirrors prepare_prefill_inputs and _prepare_ngram_context: tokens
+        ``[computed, computed + scheduled)`` of each request and the
+        ``ngram_context_len`` tokens before ``computed``, EOS-filled.
+        """
+        tokens_by_index = self._ple_early_tokens
+        num_reqs = input_batch.num_reqs
+        if (
+            tokens_by_index is None
+            or num_reqs == 0
+            or input_batch.num_draft_tokens != 0
+            or input_batch.num_tokens != input_batch.num_tokens_after_padding
+        ):
+            return None
+        starts = input_batch.num_computed_prefill_tokens_np[:num_reqs]
+        lengths = input_batch.num_scheduled_tokens[:num_reqs]
+        if np.any(starts + lengths > input_batch.prefill_len_np[:num_reqs]):
+            return None
+        sources = []
+        for req_index in input_batch.idx_mapping_np[:num_reqs]:
+            tokens = tokens_by_index.get(int(req_index))
+            if tokens is None:
+                return None
+            sources.append(tokens)
+
+        context_len = self.ngram_context_len
+        ngram_context = np.full(
+            (num_reqs, context_len), self.ngram_eos_token_id, dtype=np.int32
+        )
+        chunks = []
+        for i, tokens in enumerate(sources):
+            start, length = int(starts[i]), int(lengths[i])
+            chunks.append(tokens[start : start + length])
+            history = tokens[max(0, start - context_len) : start]
+            if history.size:
+                ngram_context[i, context_len - history.size :] = history
+        return PleCpuInputs(
+            input_ids=np.concatenate(chunks),
+            query_start_loc=np.array(
+                input_batch.query_start_loc_np[: num_reqs + 1], dtype=np.int32
+            ),
+            ngram_context=ngram_context if context_len else None,
+        )
+
+    def remove_request(self, req_index: int) -> None:
+        super().remove_request(req_index)
+        if self._ple_early_tokens is not None:
+            self._ple_early_tokens.pop(req_index, None)
+
+    def _prepare_ngram_context(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> torch.Tensor:
+        num_reqs = input_batch.num_reqs
+        num_reqs_padded = input_batch.num_reqs_after_padding
+        context = self.ngram_context[:num_reqs_padded]
+        context.fill_(self.ngram_eos_token_id)
+        if num_reqs == 0:
+            return context
+
+        request_indices = input_batch.idx_mapping[:num_reqs].long()
+        context_end = req_states.num_computed_tokens.gpu[request_indices].long()
+        token_indices = context_end.unsqueeze(1) + self.ngram_context_offsets
+        valid_tokens = token_indices >= 0
+        token_indices.clamp_min_(0)
+        context_tokens = req_states.all_token_ids.gpu[
+            request_indices.unsqueeze(1), token_indices
+        ]
+        context[:num_reqs].copy_(
+            torch.where(
+                valid_tokens,
+                context_tokens,
+                context_tokens.new_full((), self.ngram_eos_token_id),
+            )
+        )
+        return context
+
+    def prepare_inputs(
+        self,
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -> dict[str, Any]:
+        model_inputs = super().prepare_inputs(input_batch, req_states)
+        if not self.uses_ngram_embedding:
+            return model_inputs
+
+        num_reqs_padded = input_batch.num_reqs_after_padding
+        query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
+        reason = None
+        if not self._ple_kernel_config.ple_input_prepare:
+            reason = "disabled_by_kernel_config"
+        elif not self._ple_input_hardware:
+            reason = "requires_sm70"
+        elif num_reqs_padded > 64 or self.ngram_context_len > 8:
+            reason = "input_shape_has_no_calibration"
+        elif any(
+            t.dtype != torch.int32 or not t.is_cuda or not t.is_contiguous()
+            for t in (
+                query_start_loc,
+                input_batch.query_start_loc,
+                input_batch.idx_mapping,
+                req_states.num_computed_tokens.gpu,
+                req_states.all_token_ids.gpu,
+            )
+        ):
+            reason = "requires_contiguous_cuda_int32_inputs"
+        self._ple_kernel_config.ple_input_preparations["ngram_context"] = {
+            "operator": "qwen4exp_ple_input_prepare",
+            "enabled": reason is None,
+            "reason": reason,
+            "requests": input_batch.num_reqs,
+            "padded_requests": num_reqs_padded,
+            "context_length": self.ngram_context_len,
+        }
+        if reason is None:
+            from vllm.models.qwen4_exp.nvidia.sm70_ngram_input import (
+                prepare_ngram_input,
+            )
+
+            context = self.ngram_context[:num_reqs_padded]
+            prepare_ngram_input(
+                context,
+                query_start_loc,
+                input_batch.query_start_loc,
+                input_batch.idx_mapping,
+                req_states.num_computed_tokens.gpu,
+                req_states.all_token_ids.gpu,
+                input_batch.num_reqs,
+                self.ngram_eos_token_id,
+            )
+            logger.info_once("SM70 fused PLE n-gram input preparation enabled.")
+            model_inputs.update(query_start_loc=query_start_loc, ngram_context=context)
+            return model_inputs
+        query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        model_inputs.update(
+            query_start_loc=query_start_loc,
+            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+        )
+        return model_inputs
+
+    def prepare_dummy_inputs(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+    ) -> dict[str, Any]:
+        model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        if not self.uses_ngram_embedding:
+            return model_inputs
+
+        query_start_loc = self.ple_query_start_loc[: num_reqs + 1]
+        query_start_loc[0] = 0
+        tokens_per_req, num_extra_tokens = divmod(num_tokens, num_reqs)
+        query_lens = torch.full(
+            (num_reqs,),
+            tokens_per_req,
+            dtype=query_start_loc.dtype,
+            device=query_start_loc.device,
+        )
+        if num_extra_tokens > 0:
+            query_lens[-num_extra_tokens:] += 1
+        torch.cumsum(query_lens, dim=0, out=query_start_loc[1:])
+
+        ngram_context = self.ngram_context[:num_reqs]
+        ngram_context.fill_(self.ngram_eos_token_id)
+        model_inputs.update(
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+        )
+        return model_inputs
+
+
+__all__ = ["Qwen4ExpModelState"]

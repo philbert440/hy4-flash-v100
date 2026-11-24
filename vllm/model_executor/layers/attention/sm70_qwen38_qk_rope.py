@@ -1,0 +1,398 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Gated Qwen3.5 query/key norm, rotary embedding and SM70 KV publication."""
+
+import torch
+
+from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
+
+
+@triton.jit
+def _e4m3_satfinite(value):
+    bits = value.to(tl.uint32, bitcast=True)
+    sign = (bits >> 24) & 0x80
+    absolute_bits = bits & 0x7FFFFFFF
+    absolute = absolute_bits.to(tl.float32, bitcast=True)
+    limited = tl.minimum(absolute, 448.0)
+    limited_bits = limited.to(tl.uint32, bitcast=True)
+    # RNE to three fraction bits. The normal exponent bias is 7.
+    normal = (limited_bits - 0x3C000000 + 0x7FFFF + ((limited_bits >> 20) & 1)) >> 20
+    # Adding 2**14 gives an FP32 ULP of 2**-9, the FP8 subnormal step.
+    subnormal = (limited + 16384.0).to(tl.uint32, bitcast=True) - 0x46800000
+    code = tl.where(limited < 0.015625, subnormal, normal)
+    code = tl.where(absolute_bits > 0x7F800000, 0x7F, code)
+    return (code | sign).to(tl.uint8)
+
+
+@triton.jit
+def _int8_sat_rne(scaled):
+    rounded = tl.where(
+        scaled >= 0.0,
+        tl.floor(scaled + 0.5),
+        -tl.floor(-scaled + 0.5),
+    )
+    return tl.maximum(-127.0, tl.minimum(127.0, rounded)).to(tl.int8)
+
+
+# Prefill chunks can have any length. Keep length-dependent values out of the
+# specialization, or every new length compiles a kernel while a request waits.
+@triton.jit(do_not_specialize=["POS_ROW", "POS_COL", "NUM_SLOTS"])
+def _qk_norm_rope(
+    QKV,
+    QW,
+    KW,
+    Pos,
+    Cache,
+    QOut,
+    KOut,
+    GateOut,
+    STORE_GATE: tl.constexpr,
+    Slots,
+    KCache,
+    VCache,
+    KScale,
+    VScale,
+    STORE_CACHE: tl.constexpr,
+    STORE_INT8_PTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    CACHE_BLOCK: tl.constexpr,
+    CACHE_TOKEN: tl.constexpr,
+    CACHE_HEAD: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+    SCALE_TOKEN: tl.constexpr,
+    SCALE_HEAD: tl.constexpr,
+    POS_ROW: tl.int64,
+    POS_COL: tl.int64,
+    CACHE_ROWS: tl.constexpr,
+    NUM_SLOTS: tl.int64,
+    ROW: tl.constexpr,
+    Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    POS_PLANES: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    col = tl.arange(0, 256)
+    if head < Q_HEADS:
+        source = QKV + token * ROW + head * 512
+        weight = QW
+        destination = QOut + token * Q_HEADS * 256 + head * 256
+    else:
+        source = QKV + token * ROW + Q_HEADS * 512 + (head - Q_HEADS) * 256
+        weight = KW
+        destination = KOut + token * KV_HEADS * 256 + (head - Q_HEADS) * 256
+    if STORE_GATE:  # noqa: SIM102 - eliminate the optional pointer at compile time
+        if head < Q_HEADS:
+            gate = tl.load(QKV + token * ROW + head * 512 + 256 + col)
+            tl.store(GateOut + token * Q_HEADS * 256 + head * 256 + col, gate)
+    values = tl.load(source + col).to(tl.float32)
+    variance = tl.sum(values * values, 0) / 256.0
+    inverse = tl.rsqrt(variance + EPS)
+    w = tl.load(weight + col).to(tl.float32) + 1.0
+    normalized = values * inverse * w
+    # Reload only the rotary partner. Its norm shares the same variance,
+    # while its learned channel weight can differ.
+    partner = tl.where(col < 32, col + 32, tl.where(col < 64, col - 32, col))
+    pv = tl.load(source + partner).to(tl.float32)
+    pw = tl.load(weight + partner).to(tl.float32) + 1.0
+    pn = pv * inverse * pw
+    frequency = col % 32
+    plane = tl.full((256,), 0, tl.int32)
+    if POS_PLANES == 3:
+        plane = tl.where((frequency % 3 == 1) & (frequency < 33), 1, plane)
+        plane = tl.where((frequency % 3 == 2) & (frequency < 30), 2, plane)
+    position = tl.load(Pos + plane * POS_ROW + token * POS_COL)
+    position = tl.where(position < 0, position + CACHE_ROWS, position)
+    cosine = tl.load(Cache + position * 64 + frequency)
+    sine = tl.load(Cache + position * 64 + 32 + frequency)
+    # The compiled target keeps normalized rotary channels in FP32 until
+    # the final rotary store. Do not insert an intermediate FP16 rounding.
+    second = pn * sine.to(tl.float32)
+    signed_second = tl.where(col < 32, -second, second)
+    # Match the compiler's first-product FMA rather than rounding both
+    # products before the addition/subtraction.
+    rotated = tl.fma(normalized, cosine.to(tl.float32), signed_second).to(tl.float16)
+    # Cache encoding must consume the same FP16 value published to KOut,
+    # including the non-rotary channels whose normalization stays in FP32.
+    processed = tl.where(col < 64, rotated, normalized).to(tl.float16)
+    tl.store(destination + col, processed)
+    if STORE_CACHE:
+        slot = tl.load(Slots + token, mask=token < NUM_SLOTS, other=-1)
+        if slot >= 0:
+            blk = slot // BLOCK_SIZE
+            tok_off = slot % BLOCK_SIZE
+            offset = blk * CACHE_BLOCK + tok_off * CACHE_TOKEN + col
+            if STORE_INT8_PTH:
+                sc_base = blk * SCALE_BLOCK + tok_off * SCALE_TOKEN
+                if head >= Q_HEADS:
+                    kh = head - Q_HEADS
+                    pf = processed.to(tl.float32)
+                    amax = tl.max(tl.abs(pf), 0)
+                    k_sc = tl.where(amax > 0.0, amax * (1.0 / 127.0), 1.0)
+                    inv_sc = tl.where(amax > 0.0, 127.0 / amax, 0.0)
+                    tl.store(
+                        KCache + offset + kh * CACHE_HEAD,
+                        _int8_sat_rne(pf * inv_sc),
+                    )
+                    tl.store(KScale + sc_base + kh * SCALE_HEAD, k_sc)
+                elif head < KV_HEADS:
+                    v_off = Q_HEADS * 512 + (KV_HEADS + head) * 256
+                    value = tl.load(QKV + token * ROW + v_off + col).to(tl.float32)
+                    amax = tl.max(tl.abs(value), 0)
+                    v_sc = tl.where(amax > 0.0, amax * (1.0 / 127.0), 1.0)
+                    inv_sc = tl.where(amax > 0.0, 127.0 / amax, 0.0)
+                    tl.store(
+                        VCache + offset + head * CACHE_HEAD,
+                        _int8_sat_rne(value * inv_sc),
+                    )
+                    tl.store(VScale + sc_base + head * SCALE_HEAD, v_sc)
+            else:
+                if head >= Q_HEADS:
+                    head_offset = (head - Q_HEADS) * CACHE_HEAD
+                    scaled = tl.div_rn(processed.to(tl.float32), tl.load(KScale))
+                    tl.store(KCache + offset + head_offset, _e4m3_satfinite(scaled))
+                elif head < KV_HEADS:
+                    head_offset = head * CACHE_HEAD
+                    v_off = Q_HEADS * 512 + (KV_HEADS + head) * 256
+                    value = tl.load(QKV + token * ROW + v_off + col).to(tl.float32)
+                    tl.store(
+                        VCache + offset + head_offset,
+                        _e4m3_satfinite(tl.div_rn(value, tl.load(VScale))),
+                    )
+
+
+def qk_norm_rope(
+    qkv,
+    q_weight,
+    k_weight,
+    positions,
+    cache,
+    eps=1e-6,
+    key_cache=None,
+    value_cache=None,
+    slots=None,
+    k_scale=None,
+    v_scale=None,
+    q_out=None,
+    k_out=None,
+    gate_out=None,
+):
+    assert qkv.ndim == 2 and qkv.dtype == torch.float16
+    # The qualified family has six query heads per KV head. The local shard
+    # owns Q+gate, K and V; token count and TP degree do not select a kernel.
+    assert qkv.shape[1] > 0 and qkv.shape[1] % (14 * 256) == 0
+    kv_heads = qkv.shape[1] // (14 * 256)
+    q_heads = 6 * kv_heads
+    tokens = qkv.shape[0]
+    assert qkv.stride(1) == 1
+    assert q_weight.shape == k_weight.shape == (256,)
+    assert q_weight.is_contiguous() and k_weight.is_contiguous()
+    assert cache.ndim == 2 and cache.shape[1] == 64 and cache.is_contiguous()
+    assert cache.dtype == torch.float16
+    assert positions.shape in ((tokens,), (3, tokens))
+    assert positions.dtype == torch.int64
+    store_cache = key_cache is not None
+    store_int8_pth = store_cache and key_cache.dtype == torch.int8
+    if store_cache:
+        assert key_cache.shape == value_cache.shape and key_cache.ndim == 4
+        assert key_cache.shape[2:] == (kv_heads, 256)
+        assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
+        assert slots.ndim == 1 and slots.dtype == torch.int64
+        assert k_scale.dtype == v_scale.dtype == torch.float32
+        if store_int8_pth:
+            assert key_cache.dtype == value_cache.dtype == torch.int8
+            assert k_scale.shape == v_scale.shape == key_cache.shape[:3]
+            assert k_scale.stride() == v_scale.stride()
+        else:
+            assert key_cache.dtype == value_cache.dtype == torch.uint8
+            assert k_scale.numel() == v_scale.numel() == 1
+    q = (
+        q_out
+        if q_out is not None
+        else torch.empty((tokens, q_heads * 256), device=qkv.device, dtype=qkv.dtype)
+    )
+    k = (
+        k_out
+        if k_out is not None
+        else torch.empty((tokens, kv_heads * 256), device=qkv.device, dtype=qkv.dtype)
+    )
+    assert q.shape == (tokens, q_heads * 256) and k.shape == (tokens, kv_heads * 256)
+    assert q.is_contiguous() and k.is_contiguous()
+    if gate_out is not None:
+        assert gate_out.shape == q.shape and gate_out.is_contiguous()
+    _qk_norm_rope[(tokens, q_heads + kv_heads)](
+        qkv,
+        q_weight,
+        k_weight,
+        positions,
+        cache,
+        q,
+        k,
+        gate_out,
+        gate_out is not None,
+        slots,
+        key_cache,
+        value_cache,
+        k_scale,
+        v_scale,
+        store_cache,
+        store_int8_pth,
+        key_cache.shape[1] if store_cache else 0,
+        key_cache.stride(0) if store_cache else 0,
+        key_cache.stride(1) if store_cache else 0,
+        key_cache.stride(2) if store_cache else 0,
+        k_scale.stride(0) if store_int8_pth else 0,
+        k_scale.stride(1) if store_int8_pth else 0,
+        k_scale.stride(2) if store_int8_pth else 0,
+        positions.stride(0) if positions.ndim == 2 else 0,
+        positions.stride(-1),
+        cache.shape[0],
+        slots.numel() if store_cache else 0,
+        qkv.stride(0),
+        q_heads,
+        kv_heads,
+        1 if positions.ndim == 1 else 3,
+        eps,
+        # Two warps with four contiguous channels per lane reproduce the
+        # compiled norm's local partial sum and shuffle reduction order.
+        num_warps=2,
+        enable_fp_fusion=True,
+    )
+    return q, k
+
+
+def _prepare_with_cache(
+    qkv,
+    q_out,
+    k_out,
+    gate_out,
+    q_weight,
+    k_weight,
+    positions,
+    cache,
+    epsilon,
+    layer_name,
+):
+    from vllm.model_executor.layers.attention.attention import get_attention_context
+    from vllm.utils.torch_utils import _resolve_layer_name
+    from vllm.v1.attention.backends.flash_v100.kv_layout import (
+        _split_paged_kv_cache,
+    )
+    from vllm.v1.attention.kv_codecs import per_token_head_scales_for_kv_views
+
+    _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
+    kv_heads = k_out.shape[1] // 256
+    q_width = q_out.shape[1]
+    cache_args = {}
+    if slots is not None and kv_cache.numel() > 0:
+        key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+        common_eligible = (
+            key_cache.ndim == value_cache.ndim == 4
+            and key_cache.shape == value_cache.shape
+            and key_cache.shape[2:] == (kv_heads, 256)
+            and key_cache.stride() == value_cache.stride()
+            and key_cache.stride(3) == 1
+            and slots.ndim == 1
+            and slots.dtype == torch.int64
+        )
+        if (
+            common_eligible
+            and layer.kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and key_cache.dtype == value_cache.dtype == torch.uint8
+            and layer._k_scale.numel() == layer._v_scale.numel() == 1
+        ):
+            cache_args = dict(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                slots=slots,
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
+            )
+        elif (
+            common_eligible
+            and layer.kv_cache_dtype in ("int8", "int8_per_token_head")
+            and key_cache.dtype == value_cache.dtype == torch.int8
+        ):
+            ks, vs = per_token_head_scales_for_kv_views(key_cache, value_cache)
+            if ks.stride() == vs.stride():
+                cache_args = dict(
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    slots=slots,
+                    k_scale=ks,
+                    v_scale=vs,
+                )
+    qk_norm_rope(
+        qkv,
+        q_weight,
+        k_weight,
+        positions,
+        cache,
+        epsilon,
+        q_out=q_out,
+        k_out=k_out,
+        gate_out=gate_out,
+        **cache_args,
+    )
+    if slots is not None and not cache_args:
+        # Keep the standard writer for a cache layout not handled above.
+        layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+            layer,
+            k_out.view(-1, kv_heads, 256),
+            qkv[:, q_width * 2 + kv_heads * 256 :].view(-1, kv_heads, 256),
+            kv_cache,
+            slots,
+        )
+
+
+def sm70_qwen38_qk_norm_rope_cache(
+    qkv: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    gate_out: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    epsilon: float,
+    layer_name: LayerNameType,
+) -> None:
+    # Keep compiler-owned destinations, as in unified attention. Query/key
+    # dependencies order the context-owned KV update before attention.
+    _prepare_with_cache(
+        qkv,
+        q_out,
+        k_out,
+        gate_out,
+        q_weight,
+        k_weight,
+        positions,
+        cache,
+        epsilon,
+        layer_name,
+    )
+
+
+def sm70_qwen38_qk_norm_rope_cache_fake(
+    qkv: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    gate_out: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    epsilon: float,
+    layer_name: LayerNameType,
+) -> None:
+    pass
+
+
+direct_register_custom_op(
+    op_name="sm70_qwen38_qk_norm_rope_cache",
+    op_func=sm70_qwen38_qk_norm_rope_cache,
+    fake_impl=sm70_qwen38_qk_norm_rope_cache_fake,
+    mutates_args=["q_out", "k_out", "gate_out"],
+)

@@ -1,0 +1,753 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Exchange PLE data between a GPU worker and the CPU-offload process."""
+
+import os
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from multiprocessing.reduction import ForkingPickler
+from typing import Any
+
+import msgspec
+import torch
+import torch.nn as nn
+import zmq
+from cuda.bindings import driver as cuda_driver
+
+from vllm.config import VllmConfig
+from vllm.config.execution_policy import ple_policy
+from vllm.distributed.parallel_state import get_dp_group, get_tp_group
+from vllm.logger import init_logger
+from vllm.model_executor.kernels.ple.host_result import (
+    HostResultRegion,
+    host_result_capability,
+)
+from vllm.model_executor.layers.ple_offload_layer import (
+    CpuGpuSemaphore,
+    PleOffloadLayer,
+    _EarlyResultRelease,
+    begin_early_result_release,
+    finish_early_result_release,
+)
+from vllm.v1.ple_offload.draft_prefetch import DraftTokenRing
+from vllm.v1.ple_offload.fast_lane import FastLaneRequest
+from vllm.v1.ple_offload.protocol import (
+    PleCpuInputs,
+    PleOffloadRegistration,
+    PleOffloadRequest,
+)
+
+logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _PendingPleOffloadRequest:
+    """Bind request metadata to its MRV2 D2H event or its host inputs."""
+
+    request: PleOffloadRequest
+    d2h_done_event: torch.cuda.Event | None
+    cpu_inputs: PleCpuInputs | None = None
+
+
+def _cuda_check(result: Any, operation: str) -> Any:
+    """Check the ``(CUresult, ...)`` tuple returned by cuda-python calls."""
+    error = result[0] if isinstance(result, tuple) else result
+    if error.value != 0:
+        raise RuntimeError(f"{operation} failed: {error}")
+    return result
+
+
+def _dump_registration(registration: PleOffloadRegistration) -> bytes:
+    """Serialize a registration for the offload process.
+
+    CUDA tensors travel through CUDA IPC. The shared CPU input buffers are
+    sent as file descriptors: the "file_system" strategy would move their
+    storage under a torch_shm_manager owned by one GPU worker, and every
+    process holding such a storage reports its release to that manager. When
+    the engine is torn down, the manager can die first; libshm then throws
+    std::system_error ("Broken pipe") inside a storage destructor, and the
+    GPU worker or the offload process aborts with SIGABRT instead of exiting.
+    File-descriptor storages are released locally and need no manager.
+    """
+    import torch.multiprocessing as torch_mp
+
+    original_strategy = torch_mp.get_sharing_strategy()
+    torch_mp.set_sharing_strategy("file_descriptor")
+    try:
+        return bytes(ForkingPickler.dumps(registration))
+    finally:
+        torch_mp.set_sharing_strategy(original_strategy)
+
+
+class PleOffloadConnector:
+    """Connect a GPU runner to the shared PLE CPU worker.
+
+    MRV1 and MRV2 share the same CPU-input and CUDA-output IPC protocol.
+    """
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        device: torch.device,
+        ipc_addr: str,
+        *,
+        input_ids_source: torch.Tensor,
+        query_start_loc_source: torch.Tensor,
+        ngram_context_source: torch.Tensor | None,
+    ) -> None:
+        self._request_shutdown = threading.Event()
+        self._early_result_release: _EarlyResultRelease | None = None
+        self.device = device
+        self.dp_rank = get_dp_group().rank_in_group
+        self.tp_rank = get_tp_group().rank_in_group
+        self._ple_policy = ple_policy(vllm_config)
+        self._layers = self._setup_layers(vllm_config, model)
+        self._all_pinned_decode = bool(self._layers) and all(
+            getattr(layer, "_pinned_decode", False) for layer in self._layers.values()
+        )
+
+        # Both runner paths stage into the same shared buffers. TP0 registers
+        # them with CUDA so MRV2 can use asynchronous D2H copies.
+        scheduler_config = vllm_config.scheduler_config
+        self._input_ids_buf = torch.empty(
+            scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+            device="cpu",
+        ).share_memory_()
+        self._query_start_loc_buf = torch.empty(
+            scheduler_config.max_num_seqs + 1,
+            dtype=torch.int32,
+            device="cpu",
+        ).share_memory_()
+        self._ngram_context_buf = None
+        config = vllm_config.model_config.hf_text_config
+        ngram_context_len = int(config.ngram_size) - 1
+        if ngram_context_len > 0:
+            self._ngram_context_buf = torch.empty(
+                scheduler_config.max_num_seqs,
+                ngram_context_len,
+                dtype=torch.int32,
+                device="cpu",
+            ).share_memory_()
+
+        # The worker stores each finished request's seq here. Early requests
+        # stage their host inputs only after the previous request is done.
+        self._request_done_buf = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._next_seq = 0
+
+        # Runner input allocations are address-stable, so bind them once and
+        # pass only batch sizes through the per-forward request queue.
+        self._input_ids_source = input_ids_source
+        self._query_start_loc_source = query_start_loc_source
+        self._ngram_context_source = ngram_context_source
+        self._uses_cuda_inputs = self._input_ids_source.is_cuda
+        self._validate_input_sources()
+        self.early_prefill = (
+            vllm_config.kernel_config.ple_prefill_early_request
+            and self._uses_cuda_inputs
+        )
+
+        self._pinned_input_buffers: list[torch.Tensor] = []
+        self.draft_ring = self._create_draft_ring(vllm_config)
+        self.fast_lane = self._create_fast_lane(vllm_config)
+        # MRV2 may queue more than one batch under asynchronous scheduling.
+        # MRV1 remains strictly serialized and retains its existing depth-one
+        # CPU staging contract.
+        request_queue_size = (
+            vllm_config.max_concurrent_batches if self._uses_cuda_inputs else 1
+        )
+        self._request_queue: queue.Queue[_PendingPleOffloadRequest | None] = (
+            queue.Queue(maxsize=request_queue_size)
+        )
+        self._request_thread: threading.Thread | None = None
+        self._request_thread_ready = threading.Event()
+        self._zmq_ctx: zmq.Context | None = None
+        self._registration_socket: zmq.Socket | None = None
+        self._d2h_event_pool: queue.Queue[torch.cuda.Event] | None = None
+
+        try:
+            self._zmq_ctx = zmq.Context()
+            self._registration_socket = self._zmq_ctx.socket(zmq.PUSH)
+            self._registration_socket.connect(ipc_addr)
+            self._register_with_offload_worker(vllm_config, ipc_addr)
+            # Registration may move CPU storage; view the final address.
+            self._request_done = self._request_done_buf.numpy()
+
+            if self.tp_rank == 0:
+                # ForkingPickler may replace CPU storage while converting its
+                # sharing strategy, so register only the final addresses.
+                with torch.accelerator.device_index(self.device.index):
+                    self._pin_input_buffers()
+                    if self._uses_cuda_inputs:
+                        self._d2h_event_pool = queue.Queue(
+                            maxsize=vllm_config.max_concurrent_batches
+                        )
+                        for _ in range(vllm_config.max_concurrent_batches):
+                            self._d2h_event_pool.put_nowait(torch.cuda.Event())
+                self._start_request_thread(ipc_addr)
+        except Exception:
+            self.close()
+            raise
+
+    def _create_fast_lane(self, vllm_config: VllmConfig) -> FastLaneRequest | None:
+        """TP0's mapped request slot for the owner's native request lane."""
+        scheduler = vllm_config.scheduler_config
+        if (
+            self.tp_rank != 0
+            or self.early_prefill
+            or not self._uses_cuda_inputs
+            or self._ngram_context_source is None
+            or self._ngram_context_source.shape[-1] != 2
+            or not vllm_config.kernel_config.ple_fast_lane
+            or host_result_capability(self.device) is not None
+        ):
+            return None
+        try:
+            return FastLaneRequest(
+                self.device, scheduler.max_num_seqs, scheduler.max_num_batched_tokens
+            )
+        except RuntimeError as error:
+            logger.warning("PLE fast lane unavailable: %s", error)
+            return None
+
+    def _create_draft_ring(self, vllm_config: VllmConfig) -> DraftTokenRing | None:
+        """TP0 publishes drafted tokens so the worker can prefetch their rows."""
+        speculative = vllm_config.speculative_config
+        num_spec = getattr(speculative, "num_speculative_tokens", 0) or 0
+        if (
+            self.tp_rank != 0
+            or not self._uses_cuda_inputs
+            or num_spec <= 0
+            or not vllm_config.kernel_config.ple_draft_prefetch
+            or host_result_capability(self.device) is not None
+        ):
+            return None
+        try:
+            return DraftTokenRing(
+                self.device, vllm_config.scheduler_config.max_num_seqs, num_spec
+            )
+        except RuntimeError as error:
+            logger.warning("PLE draft prefetch unavailable: %s", error)
+            return None
+
+    def _setup_layers(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+    ) -> dict[str, PleOffloadLayer]:
+        """Attach output buffers and semaphores to GPU PLE placeholders."""
+        layers = {
+            name: module
+            for name, module in model.named_modules()
+            if isinstance(module, PleOffloadLayer)
+        }
+        if not layers:
+            raise RuntimeError(
+                "VLLM_PLE_CPU_OFFLOAD is enabled, but the model has no PleOffloadLayer"
+            )
+
+        config = vllm_config.model_config.hf_text_config
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self._host_result_regions: dict[str, HostResultRegion] = {}
+        mode = vllm_config.kernel_config.ple_result_transport
+        try:
+            for name, layer in layers.items():
+                # The CPU worker writes results here through CUDA IPC. The GPU
+                # placeholder waits on the paired cross-process semaphore.
+                output_buffer = torch.empty(
+                    max_num_tokens,
+                    layer.get_offload_output_dim(int(config.ple_embed_dim)),
+                    dtype=layer.get_offload_output_dtype(
+                        vllm_config.model_config.dtype
+                    ),
+                    device=self.device,
+                )
+                region = None
+                reason = None
+                if mode != "cuda":
+                    if (
+                        vllm_config.speculative_config is not None
+                        and vllm_config.speculative_config.method != "mtp"
+                    ):
+                        reason = "speculative_transport_not_qualified"
+                    elif ple_policy(vllm_config).hybrid:
+                        reason = "hybrid_local_decode"
+                    else:
+                        try:
+                            region = HostResultRegion.create(output_buffer)
+                        except (RuntimeError, ValueError) as error:
+                            reason = str(error)
+                    if region is None and mode == "mapped":
+                        raise RuntimeError(
+                            f"Mapped PLE result transport rejected: {reason}"
+                        )
+                if region is not None:
+                    self._host_result_regions[name] = region
+                    layer._cpu_output_buffer = region.result
+                layer.setup_cross_process_offload(
+                    output_buffer, CpuGpuSemaphore(self.device, host_region=region)
+                )
+                vllm_config.kernel_config.ple_result_transports[name] = {
+                    "mode": "mapped" if region is not None else "cuda",
+                    "reason": reason,
+                    "pinned_result_bytes": region.pinned_bytes if region else 0,
+                    "result_dtype": str(output_buffer.dtype),
+                    "result_width": output_buffer.shape[1],
+                    "scope": "prepared_layer_transport",
+                }
+        except Exception:
+            for region in self._host_result_regions.values():
+                region.close()
+            self._host_result_regions.clear()
+            raise
+        return layers
+
+    def _pin_input_buffers(self) -> None:
+        """Page-lock shared input allocations without replacing their storage."""
+        buffers = [self._input_ids_buf, self._query_start_loc_buf]
+        if self._ngram_context_buf is not None:
+            buffers.append(self._ngram_context_buf)
+        for buffer in buffers:
+            if buffer.device.type != "cpu" or not buffer.is_shared():
+                raise RuntimeError("PLE input buffers must be shared CPU tensors")
+            if not buffer.is_contiguous():
+                raise RuntimeError("PLE input buffers must be contiguous")
+            _cuda_check(
+                cuda_driver.cuMemHostRegister(
+                    buffer.data_ptr(),
+                    buffer.numel() * buffer.element_size(),
+                    cuda_driver.CU_MEMHOSTREGISTER_PORTABLE,
+                ),
+                "cuMemHostRegister(PLE input buffer)",
+            )
+            self._pinned_input_buffers.append(buffer)
+            if not buffer.is_pinned():
+                raise RuntimeError("CUDA did not page-lock a PLE input buffer")
+
+    def _unpin_input_buffers(self) -> None:
+        """Release CUDA registrations after the request thread has stopped."""
+        for buffer in reversed(self._pinned_input_buffers):
+            try:
+                _cuda_check(
+                    cuda_driver.cuMemHostUnregister(buffer.data_ptr()),
+                    "cuMemHostUnregister(PLE input buffer)",
+                )
+            except RuntimeError:
+                logger.exception("Failed to unregister a PLE input buffer")
+        self._pinned_input_buffers.clear()
+
+    def _register_with_offload_worker(
+        self, vllm_config: VllmConfig, ipc_addr: str
+    ) -> None:
+        """Register CUDA IPC outputs and shared CPU inputs with the worker."""
+        # Each GPU worker owns distinct output buffers, while TP0's shared
+        # inputs become the request source for its DP rank.
+        registration = PleOffloadRegistration(
+            worker_id=(
+                self.dp_rank * vllm_config.parallel_config.world_size
+                + vllm_config.parallel_config.rank
+            ),
+            tp_rank=self.tp_rank,
+            dp_rank=self.dp_rank,
+            gpu_output_buffers={
+                name: layer._gpu_output_buffer
+                for name, layer in self._layers.items()
+                if name not in self._host_result_regions
+            },
+            sem_flag_tensors={
+                name: layer._sem.shared_flag_tensor
+                for name, layer in self._layers.items()
+            },
+            cpu_output_buffers={
+                name: r.result for name, r in self._host_result_regions.items()
+            },
+            input_ids_buf=self._input_ids_buf,
+            query_start_loc_buf=self._query_start_loc_buf,
+            ngram_context_buf=self._ngram_context_buf,
+            remote_placements={
+                name: placement
+                for name, layer in self._layers.items()
+                if (placement := layer.remote_placement()) is not None
+            },
+            result_layouts={
+                name: layout
+                for name, layer in self._layers.items()
+                if (layout := layer.offload_result_layout()) is not None
+            },
+            draft_ring=None if self.draft_ring is None else self.draft_ring.host,
+            fast_lane_request=(None if self.fast_lane is None else self.fast_lane.host),
+            fast_lane_geometry=(
+                None
+                if self.fast_lane is None
+                else (self.fast_lane.max_reqs, self.fast_lane.max_tokens)
+            ),
+            draft_ring_geometry=(
+                None
+                if self.draft_ring is None
+                else (self.draft_ring.max_reqs, self.draft_ring.num_spec)
+            ),
+            request_done_buf=self._request_done_buf,
+        )
+
+        payload = _dump_registration(registration)
+        for region in self._host_result_regions.values():
+            region.validate_registration()
+        if self.draft_ring is not None:
+            self.draft_ring.validate_registration()
+        if self.fast_lane is not None:
+            self.fast_lane.validate_registration()
+        assert self._registration_socket is not None
+        self._registration_socket.send(payload)
+
+        logger.info(
+            "PleOffload: registered %d PleOffloadLayer(s) "
+            "(dp_rank=%d, tp_rank=%d, ipc_addr=%s): %s",
+            len(self._layers),
+            self.dp_rank,
+            self.tp_rank,
+            ipc_addr,
+            sorted(self._layers),
+        )
+
+    def _start_request_thread(self, ipc_addr: str) -> None:
+        """Start the thread that publishes batches after inputs are ready."""
+        self._request_thread = threading.Thread(
+            target=self._request_loop,
+            args=(ipc_addr,),
+            name=f"ple-offload-dp{self.dp_rank}",
+            daemon=True,
+        )
+        self._request_thread.start()
+        if not self._request_thread_ready.wait(timeout=10):
+            raise RuntimeError("Timed out starting the PLE request thread")
+
+    def _request_loop(self, ipc_addr: str) -> None:
+        """Wait for staged inputs, then notify the CPU worker."""
+        socket: zmq.Socket | None = None
+        try:
+            if self._zmq_ctx is None:
+                raise RuntimeError("PLE ZMQ context closed before thread startup")
+            socket = self._zmq_ctx.socket(zmq.PUSH)
+            socket.connect(ipc_addr)
+            self._request_thread_ready.set()
+            while True:
+                request = self._request_queue.get()
+                if request is None or self._request_shutdown.is_set():
+                    return
+                self._process_request(request, socket)
+        except Exception:
+            logger.exception("PLE request thread failed")
+            os._exit(1)
+        finally:
+            self._request_thread_ready.set()
+            if socket is not None:
+                socket.close(linger=0)
+
+    def _process_request(
+        self,
+        pending: _PendingPleOffloadRequest,
+        socket: zmq.Socket,
+    ) -> None:
+        """Wait for one staged batch and publish its request."""
+        request = pending.request
+        event = pending.d2h_done_event
+        if pending.cpu_inputs is not None:
+            # The worker reads the shared buffers until it finishes a request.
+            with torch.cuda.nvtx.range("ple_offload.wait_previous_request"):
+                while self._request_done[0] < request.seq - 1:
+                    if self._request_shutdown.is_set():
+                        return
+                    time.sleep(20e-6)
+            self._write_cpu_inputs(request, pending.cpu_inputs)
+        elif self._uses_cuda_inputs:
+            event_pool = self._d2h_event_pool
+            if event_pool is None or event is None:
+                raise RuntimeError("MRV2 PLE request is missing its D2H event")
+            with (
+                torch.accelerator.device_index(self.device.index),
+                torch.cuda.nvtx.range("ple_offload.wait_d2h"),
+            ):
+                event.synchronize()
+        else:
+            if event is not None:
+                raise RuntimeError("MRV1 PLE request unexpectedly has a D2H event")
+            self._copy_cpu_inputs(request)
+
+        with torch.cuda.nvtx.range("ple_offload.send_request"):
+            socket.send(msgspec.msgpack.encode(request))
+        if event is not None:
+            assert self._d2h_event_pool is not None
+            self._d2h_event_pool.put_nowait(event)
+
+    def _write_cpu_inputs(
+        self, request: PleOffloadRequest, inputs: PleCpuInputs
+    ) -> None:
+        """Stage an early request's host inputs into the shared buffers."""
+        num_tokens = request.num_tokens
+        num_reqs = request.num_reqs
+        if (
+            inputs.input_ids.shape != (num_tokens,)
+            or num_tokens < 0
+            or num_reqs < 0
+            or inputs.query_start_loc.shape != (num_reqs + 1,)
+            or (inputs.ngram_context is None) != (self._ngram_context_buf is None)
+            or num_tokens > self._input_ids_buf.shape[0]
+            or num_reqs + 1 > self._query_start_loc_buf.shape[0]
+            or (
+                inputs.ngram_context is not None
+                and self._ngram_context_buf is not None
+                and inputs.ngram_context.shape
+                != (num_reqs, self._ngram_context_buf.shape[1])
+            )
+        ):
+            raise ValueError("Early PLE inputs do not match the request shape")
+        with torch.cuda.nvtx.range("ple_offload.write_cpu_inputs"):
+            self._input_ids_buf.numpy()[:num_tokens] = inputs.input_ids
+            self._query_start_loc_buf.numpy()[: num_reqs + 1] = inputs.query_start_loc
+            if self._ngram_context_buf is not None:
+                assert inputs.ngram_context is not None
+                self._ngram_context_buf.numpy()[:num_reqs] = inputs.ngram_context
+
+    def _copy_cpu_inputs(self, request: PleOffloadRequest) -> None:
+        """Stage MRV1's existing CPU mirrors in the notifier thread."""
+        num_tokens = request.num_tokens
+        num_reqs = request.num_reqs
+        with torch.cuda.nvtx.range("ple_offload.copy_input_ids"):
+            self._input_ids_buf[:num_tokens].copy_(self._input_ids_source[:num_tokens])
+        with torch.cuda.nvtx.range("ple_offload.copy_query_start_loc"):
+            self._query_start_loc_buf[: num_reqs + 1].copy_(
+                self._query_start_loc_source[: num_reqs + 1]
+            )
+        if self._ngram_context_buf is not None:
+            assert self._ngram_context_source is not None
+            with torch.cuda.nvtx.range("ple_offload.copy_ngram_context"):
+                self._ngram_context_buf[:num_reqs].copy_(
+                    self._ngram_context_source[:num_reqs]
+                )
+
+    def _validate_input_sources(self) -> None:
+        """Validate fixed runner sources against shared input buffers."""
+        sources = [
+            ("input_ids", self._input_ids_source, self._input_ids_buf),
+            (
+                "query_start_loc",
+                self._query_start_loc_source,
+                self._query_start_loc_buf,
+            ),
+        ]
+        if (self._ngram_context_source is None) != (self._ngram_context_buf is None):
+            raise ValueError("PLE ngram_context source and buffer must match")
+        if self._ngram_context_source is not None:
+            assert self._ngram_context_buf is not None
+            sources.append(
+                (
+                    "ngram_context",
+                    self._ngram_context_source,
+                    self._ngram_context_buf,
+                )
+            )
+
+        expected_device = self.device if self._uses_cuda_inputs else torch.device("cpu")
+        for name, source, buffer in sources:
+            if (
+                source.device != expected_device
+                or source.dtype != buffer.dtype
+                or source.ndim != buffer.ndim
+                or source.shape[0] < buffer.shape[0]
+                or source.shape[1:] != buffer.shape[1:]
+            ):
+                raise ValueError(f"PLE {name} source is incompatible")
+
+    def _enqueue_cuda_inputs(
+        self,
+        request: PleOffloadRequest,
+        d2h_done_event: torch.cuda.Event,
+    ) -> None:
+        """Stage MRV2 inputs on the model stream and record completion.
+
+        The request owns ``d2h_done_event`` until its shared inputs are visible
+        to the CPU worker. Reusing one background-stream event lets a later
+        batch retarget the event before the previous request has consumed its
+        inputs, which can deadlock CUDA Graph replay when the batch size changes.
+        """
+        with torch.accelerator.device_index(self.device.index):
+            stream = torch.cuda.current_stream(self.device)
+            with torch.cuda.nvtx.range("ple_offload.copy_input_ids"):
+                self._input_ids_buf[: request.num_tokens].copy_(
+                    self._input_ids_source[: request.num_tokens],
+                    non_blocking=True,
+                )
+            with torch.cuda.nvtx.range("ple_offload.copy_query_start_loc"):
+                self._query_start_loc_buf[: request.num_reqs + 1].copy_(
+                    self._query_start_loc_source[: request.num_reqs + 1],
+                    non_blocking=True,
+                )
+            if self._ngram_context_buf is not None:
+                assert self._ngram_context_source is not None
+                with torch.cuda.nvtx.range("ple_offload.copy_ngram_context"):
+                    self._ngram_context_buf[: request.num_reqs].copy_(
+                        self._ngram_context_source[: request.num_reqs],
+                        non_blocking=True,
+                    )
+            d2h_done_event.record(stream)
+
+    def _launch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        cpu_inputs: PleCpuInputs | None = None,
+    ) -> None:
+        """Queue one batch while keeping staging off the model thread."""
+        # Inputs are replicated across TP ranks. One request per DP rank drives
+        # the CPU result fan-out to every registered TP output buffer.
+        if self.tp_rank != 0:
+            return
+        fast_lane = self.fast_lane
+        if fast_lane is not None and fast_lane.active:
+            # The owner's native thread serves this mapped request directly.
+            assert self._ngram_context_source is not None
+            fast_lane.publish(
+                self._input_ids_source,
+                self._query_start_loc_source,
+                self._ngram_context_source,
+                num_reqs,
+                num_tokens,
+            )
+            return
+
+        self._next_seq += 1
+        request = PleOffloadRequest(
+            dp_rank=self.dp_rank,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            seq=self._next_seq,
+        )
+        if cpu_inputs is not None:
+            # Prompt-only inputs are known on the host: no D2H wait behind the
+            # previous forward on the model stream.
+            self._request_queue.put_nowait(
+                _PendingPleOffloadRequest(request, None, cpu_inputs)
+            )
+            return
+        d2h_done_event = None
+        if self._uses_cuda_inputs:
+            if self._d2h_event_pool is None:
+                raise RuntimeError("PLE D2H event pool is not initialized")
+            try:
+                d2h_done_event = self._d2h_event_pool.get_nowait()
+            except queue.Empty as exc:
+                raise RuntimeError(
+                    "PLE has more MRV2 requests than configured concurrent batches"
+                ) from exc
+            self._enqueue_cuda_inputs(request, d2h_done_event)
+        self._request_queue.put_nowait(
+            _PendingPleOffloadRequest(request, d2h_done_event)
+        )
+
+    def prepare_forward(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        dummy_run: bool,
+        use_local_model: bool = False,
+        cpu_inputs: PleCpuInputs | None = None,
+        eager_forward: bool = False,
+    ) -> None:
+        """Submit real inputs or satisfy the PLE wait for a dummy forward.
+
+        ``cpu_inputs`` and ``eager_forward`` (no CUDA graph replay) are used
+        only with ``kernel_config.ple_prefill_early_request``.
+        """
+        finish_early_result_release(getattr(self, "_early_result_release", None))
+        self._early_result_release = None
+        if dummy_run:
+            self.signal_dummy_outputs(num_tokens)
+            return
+        if use_local_model and (self._ple_policy.hybrid or self._all_pinned_decode):
+            return
+        self._early_result_release = begin_early_result_release(
+            self.early_prefill and eager_forward and bool(self._host_result_regions),
+            (layer._sem.flag_tensor.data_ptr() for layer in self._layers.values())
+            if self.early_prefill and eager_forward
+            else (),
+        )
+        if self.early_prefill and cpu_inputs is not None:
+            self._launch(num_reqs, num_tokens, cpu_inputs)
+        else:
+            self._launch(num_reqs, num_tokens)
+
+    def signal_dummy_outputs(self, num_tokens: int) -> None:
+        """Locally satisfy PLE waits for dummy and capture forwards."""
+        # Dummy and capture forwards do not send CPU requests, but every PLE
+        # placeholder still waits for a completed output semaphore.
+        stream = torch.cuda.current_stream(self.device)
+        for layer in self._layers.values():
+            if (cpu_output := getattr(layer, "_cpu_output_buffer", None)) is not None:
+                cpu_output[:num_tokens].zero_()
+            layer._gpu_output_buffer[:num_tokens].zero_()
+            layer._sem.signal(stream)
+
+    def release_outputs(self) -> None:
+        """Mark GPU output buffers reusable after the model consumes them."""
+        # Reset only after the consumer forward so the CPU worker cannot
+        # overwrite an output that a GPU PLE placeholder may still read. Mapped
+        # results released early by the wait op (eager prefill) are skipped:
+        # the worker may already have published the next chunk into them.
+        stream = torch.cuda.current_stream(self.device)
+        released = finish_early_result_release(
+            getattr(self, "_early_result_release", None)
+        )
+        self._early_result_release = None
+        for layer in self._layers.values():
+            if (
+                layer._is_cpu_offloaded
+                and layer._sem.flag_tensor.data_ptr() in released
+            ):
+                continue
+            layer.release_offloaded_output(stream)
+
+    def close(self) -> None:
+        """Stop request transport and release host registrations."""
+        finish_early_result_release(getattr(self, "_early_result_release", None))
+        self._early_result_release = None
+        if (shutdown := getattr(self, "_request_shutdown", None)) is not None:
+            shutdown.set()
+        request_thread = self._request_thread
+        if request_thread is not None and request_thread.is_alive():
+            try:
+                self._request_queue.put(None, timeout=5)
+            except queue.Full:
+                logger.error("Timed out stopping the PLE request thread")
+            request_thread.join(timeout=5)
+        if request_thread is not None and request_thread.is_alive():
+            # The thread may still access the registered buffers or ZMQ context.
+            logger.error("PLE request thread did not stop; deferring resource cleanup")
+            return
+        self._request_thread = None
+
+        if self._pinned_input_buffers:
+            with torch.accelerator.device_index(self.device.index):
+                self._unpin_input_buffers()
+        for region in getattr(self, "_host_result_regions", {}).values():
+            region.close()
+        self._host_result_regions = {}
+        draft_ring = getattr(self, "draft_ring", None)
+        if draft_ring is not None:
+            draft_ring.close()
+            self.draft_ring = None
+        fast_lane = getattr(self, "fast_lane", None)
+        if fast_lane is not None:
+            fast_lane.close()
+            self.fast_lane = None
+        self._d2h_event_pool = None
+        if self._registration_socket is not None:
+            self._registration_socket.close(linger=0)
+            self._registration_socket = None
+        if self._zmq_ctx is not None:
+            self._zmq_ctx.term()
+            self._zmq_ctx = None
