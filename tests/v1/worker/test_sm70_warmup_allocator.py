@@ -29,6 +29,8 @@ def test_compile_allocator_restored_before_measuring_or_returning(
     monkeypatch.setattr(gpu_worker, "configure_attention_workspace", lambda *a: None)
     monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *a: [])
     monkeypatch.setattr(gpu_worker.current_platform, "is_cuda", lambda: cuda)
+    # The platform is synthetic. A CPU allocator test has no CUDA device stack.
+    monkeypatch.setattr(gpu_worker, "CudaRTLibrary", lambda: None)
     monkeypatch.setattr(
         gpu_worker.current_platform, "is_device_capability", lambda _: sm70
     )

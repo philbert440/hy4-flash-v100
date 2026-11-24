@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 from types import SimpleNamespace
 
@@ -12,9 +13,17 @@ from torch.nn import functional as F
 
 from vllm.config import DeviceConfig
 from vllm.distributed import parallel_state
+from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+    Nvfp4SkinnySm70Experts,
+    nvfp4_skinny_scale_reason,
+)
+from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
-from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptNvFp4Config,
+    ModelOptNvFp4FusedMoE,
+)
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import Mxfp4SM70MoEMethod
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     ModelOptNvFp4SM70MoEMethod,
@@ -107,7 +116,14 @@ def _load(sample, monkeypatch, vllm_config, device):
     )
     if device == "cpu":
         monkeypatch.setattr(sm70_tm, "is_exact_sm70_cuda_platform", lambda: True)
-        monkeypatch.setattr(sm70_tm, "should_use_nvfp4_moe_turbomind", lambda: True)
+        monkeypatch.setattr(
+            Nvfp4SkinnySm70Experts, "_supports_current_device", staticmethod(lambda: True)
+        )
+        if not hasattr(torch.ops._C, "skinny_moe_qpn_sm70"):
+            # Exercise admission without invoking a native CUDA operator.
+            monkeypatch.setattr(
+                torch.ops._C, "skinny_moe_qpn_sm70", object(), raising=False
+            )
     else:
         vllm_config.device_config = DeviceConfig(device=device)
     model.layers = nn.ModuleList([nn.Module(), nn.Module()])
@@ -122,8 +138,8 @@ def _load(sample, monkeypatch, vllm_config, device):
     )
     assert isinstance(mlp.routed_expert_down_proj.quant_method, UnquantizedLinearMethod)
     layer = mlp.experts
-    assert isinstance(layer.quant_method, ModelOptNvFp4SM70MoEMethod)
-    assert layer.quant_method.use_a16
+    assert type(layer.quant_method) is ModelOptNvFp4FusedMoE
+    assert layer.quant_method.nvfp4_backend is NvFp4MoeBackend.SM70_SKINNY
     assert layer.swiglu_limit == 10.0
     assert (layer.top_k, layer.local_num_experts) == (16, 512)
     assert (layer.hidden_size, layer.intermediate_size_per_partition) == (1536, 384)
@@ -159,6 +175,10 @@ def _dequant(packed, scale, global_scale):
 def test_hy4_nvfp4_loader_tp4_cpu(sample, monkeypatch, tp1):
     layer = _load(sample, monkeypatch, tp1, device="cpu")
     _validate_weight_layout(layer)
+    assert nvfp4_skinny_scale_reason(
+        layer.w13_weight_scale_2[list(_LOADED_EXPERTS)],
+        layer.w2_weight_scale_2[list(_LOADED_EXPERTS)],
+    ) == "gate and up global scales require a shared factor"
     _, reference = sample
     for expert in _LOADED_EXPERTS:
         for index, projection in enumerate(("gate_proj", "up_proj")):
@@ -226,8 +246,12 @@ def test_hy4_fp4_clamp_cpu(monkeypatch, method):
 @torch.inference_mode()
 def test_hy4_nvfp4_sm70_against_torch(sample, monkeypatch, tp1):
     layer = _load(sample, monkeypatch, tp1, device="cuda")
+    # The checkpoint stores independent gate/up scales, so 1Cat switches to
+    # TurboMind after loading. Run the numeric oracle on the selected method.
+    layer.quant_method.process_weights_after_loading(layer)
     method = layer.quant_method
-    method.process_weights_after_loading(layer)
+    assert type(method) is ModelOptNvFp4SM70MoEMethod
+    assert method.use_a16
     assert not layer.sm70_nvfp4_qwen38_fused_swiglu_prefill
     x = (
         torch.randn(7, _HIDDEN, generator=torch.Generator().manual_seed(97))

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 import functools
 import gc
@@ -10,7 +11,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -59,6 +60,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -124,7 +126,7 @@ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import DeviceMemoryProfiler, MemorySnapshot, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.utils.platform_utils import is_pin_memory_available, num_compute_units
 from vllm.utils.torch_utils import (
@@ -267,6 +269,12 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.models.hy_v4_flash.sm70.cache import FlashMetadata
+    from vllm.models.hy_v4_flash.sm70.dfly_proposer import DFlyProposer
+    from vllm.models.hy_v4_flash.sm70.verification import (
+        VerificationGraph,
+        VerificationState,
+    )
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
@@ -1247,6 +1255,7 @@ class GPUModelRunner(
     ):
         self.vllm_config = vllm_config
         self._diagnostics = bind_diagnostics(vllm_config)
+        self.hy4_inline_drafts = False
         self.model_config = vllm_config.model_config
         self.mm_encoder_batch_size = getattr(
             self.model_config.multimodal_config, "mm_encoder_batch_size", 0
@@ -1332,6 +1341,8 @@ class GPUModelRunner(
         self.use_alibi = model_config.uses_alibi
 
         text_config = model_config.hf_text_config
+        self._is_hy4_flash = text_config.model_type == "hy_v4_flash"
+        self._hy4_verification: VerificationState | None = None
         ple_layer_ids = getattr(text_config, "ple_layer_ids", ())
         self.uses_ngram_embedding = bool(ple_layer_ids)
         self.uses_flash_engram = text_config.model_type == "hy_v4_flash" and bool(
@@ -1494,6 +1505,7 @@ class GPUModelRunner(
                 | EagleProposer
                 | DFlashProposer
                 | DSparkProposer
+                | DFlyProposer  # noqa: F823
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -1502,7 +1514,16 @@ class GPUModelRunner(
                 | Qwen4ExpMTPProposer
                 | None
             )
-            if self.speculative_config.method == "custom_class":
+            if self.speculative_config.method == "dfly":
+                from vllm.models.hy_v4_flash.sm70.dfly_proposer import DFlyProposer
+
+                from vllm.models.hy_v4_flash.profile import speed_setting
+
+                self.drafter = DFlyProposer(self.vllm_config, self.device)
+                self.hy4_inline_drafts = (
+                    speed_setting("VLLM_V41_INLINE_DRAFTS", self.vllm_config) == "1"
+                )
+            elif self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
                     self.vllm_config
                 )
@@ -2356,6 +2377,17 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if self.speculative_config and self.speculative_config.method == "dfly":
+            self.drafter.forget_requests(scheduler_output.finished_req_ids)
+            self.drafter.forget_requests(scheduler_output.preempted_req_ids or ())
+            self.drafter.forget_requests(
+                scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            )
+        if (verification := getattr(self, "_hy4_verification", None)) is not None:
+            verification.forget(scheduler_output.finished_req_ids)
+            verification.forget(scheduler_output.preempted_req_ids or ())
+            verification.forget(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+
         self._dynamic_draft_vocab_prefill_bootstrap.clear_finished_requests(
             scheduler_output.finished_req_ids
         )
@@ -4908,11 +4940,124 @@ class GPUModelRunner(
         self._prepare_input_ids_base(
             scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens
         )
+        if getattr(self, "_hy4_dfly_deferred", None) is not None:
+            self._hy4_write_deferred_drafts(scheduler_output, num_reqs, cu_num_tokens)
         if _V41_MICRO:
             # After the base path: requests in common with the previous step
             # already have their drafts; the rest read the table (same values
             # where both exist).
             self._v41_fill_drafts(scheduler_output, num_reqs, cu_num_tokens)
+
+    def _hy4_dfly_can_defer(self, scheduler_output: "SchedulerOutput") -> bool:
+        """HY4_DREV2_DEFER_DRAFTS: no host consumer reads the next drafts' values.
+
+        Penalties, bad words, thinking budgets, custom logits processors and
+        structured output read draft ids on the host; greedy and plain sampled
+        verification read them from the device input ids.
+        """
+        batch = self.input_batch
+        holder = batch.thinking_budget_state_holder
+        return bool(
+            self.drafter.defer_drafts
+            and not self.use_async_scheduling
+            and not scheduler_output.has_structured_output_requests
+            and batch.no_penalties
+            and not batch.bad_words_token_ids
+            and not (holder is not None and holder.has_tracked_requests())
+            and not self.model_config.logits_processors
+        )
+
+    def _hy4_dconf2_late_pending(self) -> bool:
+        # Plain servers have no drafter attribute.
+        return getattr(getattr(self, "drafter", None), "late", None) is not None
+
+    def _hy4_dconf2_resolve_width(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "SchedulerOutput":
+        """HY4_DCONF2_LATE_WIDTH: cut the deferred row's scheduled drafts.
+
+        The engine scheduled every placeholder. The confidence copy has had the
+        engine's schedule and IPC to land, so the wait here is the remainder of
+        the score graph. Shrinking before _update_states gives the worker the
+        schedule fast11 sends for this cut; the scheduler subtracts the unused
+        drafts as rejections.
+        """
+        drafter = self.drafter
+        deferred = getattr(self, "_hy4_dfly_deferred", None)
+        if deferred is None or len(deferred[0]) != 1:
+            drafter.late = None
+            return scheduler_output
+        (req_id,) = deferred[0]
+        ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+        if not ids:
+            drafter.late = None
+            return scheduler_output
+        width = drafter.confidence_width(drafter.late_scores())
+        cut = len(ids) - width
+        if cut <= 0:
+            return scheduler_output
+        self._hy4_dconf2_unused = {req_id: cut}
+        num_scheduled = dict(scheduler_output.num_scheduled_tokens)
+        num_scheduled[req_id] -= cut
+        spec = dict(scheduler_output.scheduled_spec_decode_tokens)
+        if width:
+            spec[req_id] = ids[:width]
+        else:
+            del spec[req_id]
+            self._hy4_dfly_deferred = None
+        return replace(
+            scheduler_output,
+            num_scheduled_tokens=num_scheduled,
+            scheduled_spec_decode_tokens=spec,
+            total_num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens - cut,
+            mixed_decode_tokens=max(0, scheduler_output.mixed_decode_tokens - cut),
+        )
+
+    def _hy4_write_deferred_drafts(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        """Copy the previous DFly draft graph's ids over their placeholders.
+
+        A scheduled request's draft tokens are the last tokens of its query, as in
+        _prepare_input_ids_base. The copy follows the host-to-device input copy and
+        the draft graph on the same stream.
+        """
+        rows, proposed = self._hy4_dfly_deferred
+        self._hy4_dfly_deferred = None
+        width = proposed.shape[1]
+        scheduled = scheduler_output.scheduled_spec_decode_tokens
+        targets: list[int] = []
+        sources: list[int] = []
+        for index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            row = rows.get(req_id)
+            count = len(scheduled.get(req_id, ()))
+            if row is None or count == 0:
+                continue
+            if count > width:
+                raise RuntimeError("DFly scheduled more drafts than it proposed")
+            end = int(cu_num_tokens[index])
+            if num_reqs == 1:
+                # Both slices are contiguous. Copy and cast on the same stream
+                # as the picker without staging gather indices from the host.
+                self.input_ids.gpu[end - count : end].copy_(proposed[row, :count])
+                return
+            targets.extend(range(end - count, end))
+            sources.extend(range(row * width, row * width + count))
+        if not targets:
+            return
+        index = torch.tensor(
+            (targets, sources), dtype=torch.long, pin_memory=self.device.type == "cuda"
+        )
+        index = index.to(self.device, non_blocking=True)
+        input_ids = self.input_ids.gpu
+        input_ids.index_copy_(
+            0,
+            index[0],
+            proposed.reshape(-1).index_select(0, index[1]).to(input_ids.dtype),
+        )
 
     def _prepare_input_ids_base(
         self,
@@ -8532,6 +8677,86 @@ class GPUModelRunner(
             trace_override=_dflash_ddtree_worker_profile_enabled(),
         )
 
+    def _hy4_dfly_graphs_enabled(self) -> bool:
+        return (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dfly"
+            and self.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_DECODE_ONLY
+        )
+
+    def _prepare_hy4_dfly_target(
+        self, draft_counts: Sequence[int], running: int | None = None
+    ):
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        position_deltas = (
+            tuple(int(self.requests[r].mrope_position_delta) for r in req_ids)
+            if self.uses_mrope else None
+        )
+        return cast("DFlyProposer", self.drafter).prepare_target(
+            self.query_start_loc.np[: num_reqs + 1],
+            self.optimistic_seq_lens_cpu[:num_reqs].numpy(),
+            self.discard_request_mask.np[:num_reqs],
+            draft_counts,
+            req_ids,
+            running,
+            position_deltas,
+        )
+
+    def _finalize_forward_graphs(
+        self, cudagraph_mode, hy4_graph, plain_snapshot, hy4_eager
+    ):
+        if self.calculate_kv_scales:
+            # Scale calculation involves dynamic operations for one forward.
+            cudagraph_mode = CUDAGraphMode.NONE
+            self.calculate_kv_scales = False
+        if cudagraph_mode != CUDAGraphMode.FULL and (
+            hy4_graph is not None or plain_snapshot is not None
+        ):
+            hy4_graph = plain_snapshot = None
+            hy4_eager = True
+        return cudagraph_mode, hy4_graph, plain_snapshot, hy4_eager
+
+    def _hy4_verification_forward(
+        self,
+        metadata: PerLayerAttnMetadata | None,
+        req_ids: Sequence[str],
+        widths: Sequence[int],
+        verify_ids: set[str],
+        graph: "VerificationGraph | None" = None,
+        *,
+        plain_decode_graph: bool = False,
+    ) -> AbstractContextManager[None]:
+        from vllm.models.hy_v4_flash.sm70.cache import QuerySpan
+
+        state = self._hy4_verification
+        assert state is not None
+        requests = []
+        begin = 0
+        for row, (req_id, width) in enumerate(zip(req_ids, widths, strict=True)):
+            # Synchronous V1 publishes the rejection-adjusted scheduler cursor.
+            prefix = int(self.input_batch.num_computed_tokens_cpu[row])
+            if prefix != self.requests[req_id].num_computed_tokens:
+                raise RuntimeError("Hy4 runner cursor disagrees with scheduler")
+            end = begin + width
+            requests.append((req_id, QuerySpan(begin, end, prefix, prefix + width)))
+            begin = end
+        if isinstance(metadata, list):
+            raise RuntimeError("Hy4 verification requires an unsplit batch")
+        return state.forward(
+            cast("dict[str, FlashMetadata] | None", metadata),
+            self.compilation_config.static_forward_context if metadata else {},
+            requests,
+            verify_ids,
+            {
+                req_id: int(self.input_batch.num_tokens_no_spec[row])
+                for row, req_id in enumerate(req_ids)
+            },
+            graph,
+            plain_decode_graph=plain_decode_graph,
+        )
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -8647,6 +8872,7 @@ class GPUModelRunner(
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
         attention_context_len: int | None = None,
+        hy4_exact_decode: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -8677,7 +8903,7 @@ class GPUModelRunner(
 
         if (
             attention_context_len is None
-            and uniform_decode
+            and (uniform_decode or hy4_exact_decode)
             and num_reqs > 0
             and self.cudagraph_dispatcher.has_attention_context_specialization
         ):
@@ -8710,6 +8936,19 @@ class GPUModelRunner(
             )
 
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
+            if hy4_exact_decode:
+                desc = BatchDescriptor(num_tokens, num_reqs, uniform=True)
+                if self.cudagraph_dispatcher.hy4_index_bypass_width:
+                    desc = self.cudagraph_dispatcher.get_context_bucket_descriptor(
+                        desc, attention_context_len
+                    )
+                if (
+                    not (force_eager or disable_full or has_lora)
+                    and desc
+                    in self.cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+                ):
+                    return CUDAGraphMode.FULL, desc
+                return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
@@ -8933,6 +9172,8 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        if self._hy4_dconf2_late_pending():
+            scheduler_output = self._hy4_dconf2_resolve_width(scheduler_output)
         if self.device.type == "cuda":
             self.mixed_prefill_timer.begin(scheduler_output)
         if _V41_TRUNC_CUTOFF:
@@ -9073,6 +9314,37 @@ class GPUModelRunner(
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+            hy4_verify_ids = set()
+            hy4_scoped_forward = hy4_eager = False
+            if self._is_hy4_flash and (
+                scheduler_output.scheduled_spec_decode_tokens
+                or self._hy4_verification is not None
+            ):
+                hy4_verify_ids = {
+                    req_id
+                    for req_id, drafts in (
+                        scheduler_output.scheduled_spec_decode_tokens.items()
+                    )
+                    if drafts
+                }
+                if hy4_verify_ids and self._hy4_verification is None:
+                    from vllm.models.hy_v4_flash.sm70.verification import (
+                        VerificationState,
+                    )
+
+                    self._hy4_verification = VerificationState()
+                state = self._hy4_verification
+                if state is not None:
+                    hy4_eager = bool(hy4_verify_ids) or any(
+                        state.has_pending(req_id) for req_id in req_ids
+                    )
+                    hy4_scoped_forward = hy4_eager or any(
+                        state.tracks(req_id) for req_id in req_ids
+                    )
+                if hy4_scoped_forward and self.use_async_scheduling:
+                    raise RuntimeError(
+                        "Hy4 verification requires synchronous scheduling"
+                    )
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
             trace_prepare_inputs_t0 = time.perf_counter() if trace_log else 0.0
@@ -9082,6 +9354,47 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            dfly_step = hy4_graph = plain_snapshot = None
+            hy4_partial_verify = False
+            force_uniform_decode = self._compute_force_uniform_decode(scheduler_output)
+            if self.speculative_config and self.speculative_config.method == "dfly":
+                counts = (
+                    spec_decode_metadata.num_draft_tokens
+                    if spec_decode_metadata is not None
+                    else (0,) * num_reqs
+                )
+                dfly_step = self._prepare_hy4_dfly_target(
+                    counts, scheduler_output.hy4_dfly_draft_load
+                )
+                # A live snapshot observes selection inside the target forward.
+                # This step needs eager dispatch even when each request has one row.
+                hy4_eager |= dfly_step is not None
+                if max_num_scheduled_tokens == 1 and force_uniform_decode is not False:
+                    plain_snapshot = self.drafter.plain_histories.get(num_reqs)
+                    if plain_snapshot is not None:
+                        hy4_eager = False
+                hy4_partial_verify = (
+                    self.drafter.variable_verify
+                    and num_reqs == 1
+                    and 0 < counts[0] < self.num_spec_tokens
+                    and tokens[0] == counts[0] + 1
+                )
+                if (
+                    self._hy4_dfly_graphs_enabled()
+                    and len(hy4_verify_ids) == num_reqs
+                    and (
+                        hy4_partial_verify
+                        or all(
+                            n == self.uniform_decode_query_len
+                            and count == self.num_spec_tokens
+                            for n, count in zip(tokens, counts, strict=True)
+                        )
+                    )
+                ):
+                    # Use the original batch shape; padding can change GEMM
+                    # dispatch and thus the target's verification logits.
+                    hy4_graph = self.drafter.verify_graphs.get(num_tokens_unpadded)
+                    hy4_eager = hy4_graph is None
             # VLLM_V41_VISION: whether this step holds image-span tokens.
             set_vision = getattr(self.get_model(), "v41_set_vision", None)
             if set_vision is not None:
@@ -9118,11 +9431,16 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
-                force_uniform_decode=self._compute_force_uniform_decode(
-                    scheduler_output
-                ),
+                force_eager=hy4_eager,
+                allow_microbatching=not hy4_eager,
+                force_uniform_decode=force_uniform_decode,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                hy4_exact_decode=plain_snapshot is not None or hy4_partial_verify,
             )
+            if plain_snapshot is not None and cudagraph_mode != CUDAGraphMode.FULL:
+                # An eager fallback can collect its current rows directly.
+                hy4_eager = hy4_scoped_forward or dfly_step is not None
+                plain_snapshot = None
             if trace_log:
                 trace_batch_desc_ms = (
                     time.perf_counter() - trace_batch_desc_t0
@@ -9300,17 +9618,21 @@ class GPUModelRunner(
         if _v41_trace.ENABLED:
             _v41_trace.gmark("data")
 
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        if self.calculate_kv_scales:
-            cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False
+        if (
+            self.calculate_kv_scales
+            or hy4_graph is not None
+            or plain_snapshot is not None
+        ):
+            cudagraph_mode, hy4_graph, plain_snapshot, hy4_eager = (
+                self._finalize_forward_graphs(
+                    cudagraph_mode, hy4_graph, plain_snapshot, hy4_eager
+                )
+            )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
@@ -9364,7 +9686,7 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input or hy4_eager,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -9372,16 +9694,36 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if dfly_step is not None:
+                get_forward_context().additional_kwargs["hy4_dfly"] = dfly_step
             if _v41_trace.ENABLED:
                 _v41_trace.mark("fwd_call")
                 _v41_trace.gmark("fwd_start")
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            with (
+                self._hy4_verification_forward(
+                    attn_metadata
+                    if hy4_eager or hy4_graph is not None or plain_snapshot is not None
+                    else None,
+                    req_ids,
+                    tokens,
+                    hy4_verify_ids,
+                    hy4_graph,
+                    plain_decode_graph=plain_snapshot is not None,
+                )
+                if hy4_scoped_forward
+                else nullcontext()
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+        snapshot = hy4_graph or plain_snapshot
+        if snapshot is not None and dfly_step is not None:
+            dfly_step.histories = snapshot.histories
+            dfly_step.full_snapshot = True
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
         if trace_log:
@@ -9820,7 +10162,6 @@ class GPUModelRunner(
 
         def propose_draft_token_ids(sampled_token_ids):
             nonlocal trace_draft_ms
-            assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 trace_draft_t0 = time.perf_counter() if trace_log else 0.0
                 mtp_draft_wall_start = (
@@ -9855,9 +10196,11 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
-            # Decide whether to run the drafter or zero out draft tokens.
-            input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
-                spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+            # DFly validates each accepted anchor against its context limit.
+            dfly = spec_config.method == "dfly"
+            input_fits_in_drafter = dfly or (
+                spec_decode_common_attn_metadata is not None
+                and spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
                 <= self.effective_drafter_max_model_len
             )
             use_gpu_toks = (
@@ -10026,6 +10369,10 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
+            unused = getattr(self, "_hy4_dconf2_unused", None)
+            if unused is not None:
+                output.hy4_unused_drafts = unused
+                self._hy4_dconf2_unused = None
             if trace_log:
                 trace_output_ms = (time.perf_counter() - trace_output_t0) * 1000.0
 
@@ -10753,7 +11100,7 @@ class GPUModelRunner(
         sample_hidden_states: torch.Tensor,
         aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
-        common_attn_metadata: CommonAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata | None,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -10770,6 +11117,24 @@ class GPUModelRunner(
         self._ddtree_parent_metadata = None
         self._ddtree_accepted_rows_cpu_sidecar = None
         self._ddtree_sampled_token_counts_cpu_sidecar = None
+        if spec_config.method == "dfly":
+            assert isinstance(sampled_token_ids, list)
+            drafter = cast("DFlyProposer", self.drafter)
+            drafts = drafter.propose(
+                sampled_token_ids,
+                hidden_states,
+                defer=self._hy4_dfly_can_defer(scheduler_output),
+            )
+            if drafter.deferred is not None:
+                rows, proposed = drafter.deferred
+                drafter.deferred = None
+                req_ids = self.input_batch.req_ids
+                self._hy4_dfly_deferred = (
+                    {req_ids[row]: index for index, row in enumerate(rows)},
+                    proposed,
+                )
+            return drafts
+        assert common_attn_metadata is not None
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -11306,6 +11671,7 @@ class GPUModelRunner(
             is_breakable_cudagraph_enabled()
             and cudagraph_mode != CUDAGraphMode.NONE
             and not self.parallel_config.use_ubatching
+            and not self._hy4_dfly_graphs_enabled()
         ):
             self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)
             drafter = getattr(self, "drafter", None)
@@ -11472,6 +11838,18 @@ class GPUModelRunner(
                     weights_not_loaded,
                 )
 
+    def _hy4_prompt_logprobs_tile(self) -> int | None:
+        if self.model_config.hf_text_config.model_type == "hy_v4_flash":
+            return 512
+        return None
+
+    def _compute_prompt_logprobs(
+        self, hidden_states: torch.Tensor, topk: int, token_ids: torch.Tensor
+    ) -> LogprobsTensors:
+        logits = self.model.compute_logits(hidden_states)
+        logprobs = self.sampler.compute_logprobs(logits)
+        return self.sampler.gather_logprobs(logprobs, topk, token_ids)
+
     def _get_prompt_logprobs_dict(
         self,
         hidden_states: torch.Tensor,
@@ -11499,9 +11877,6 @@ class GPUModelRunner(
                 continue
 
             num_prompt_tokens = len(request.prompt_token_ids)
-            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(
-                self.device, non_blocking=True
-            )
 
             # Set up target LogprobsTensors object.
             logprobs_tensors = request.in_progress_prompt_logprobs_cpu
@@ -11540,29 +11915,31 @@ class GPUModelRunner(
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            # Bound Hy4's FP32 all-gather and log-softmax to the shape used
+            # by the startup profile. Each row is independent.
+            tile = self._hy4_prompt_logprobs_tile() or num_logits
+            for first in range(0, num_logits, tile):
+                last = min(first + tile, num_logits)
+                tgt_token_ids = torch.tensor(
+                    request.prompt_token_ids[start_tok + first : start_tok + last],
+                    dtype=torch.int64,
+                ).to(self.device, non_blocking=True)
+                token_ids, logprobs, ranks, _ = self._compute_prompt_logprobs(
+                    hidden_states[offset + first : offset + last],
+                    num_prompt_logprobs,
+                    tgt_token_ids,
+                )
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
-
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
-
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+                # Transfer GPU->CPU async.
+                chunk_slice = slice(start_idx + first, start_idx + last)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    ranks, non_blocking=True
+                )
+                del token_ids, logprobs, ranks
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
@@ -11764,7 +12141,24 @@ class GPUModelRunner(
         # When setting max_query_len = 1, we switch to and capture the optimized
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
+        hy4_plain_decode = (
+            batch_descriptor_override is not None
+            and batch_descriptor_override.uniform
+            and batch_descriptor_override.num_tokens == batch_descriptor_override.num_reqs
+            and self._hy4_dfly_graphs_enabled()
+            and (self.drafter.gate is not None or self.drafter.confidence_mode != "off")
+        )
+        hy4_partial_verify = (
+            batch_descriptor_override is not None
+            and batch_descriptor_override.uniform
+            and batch_descriptor_override.num_reqs == 1
+            and self._hy4_dfly_graphs_enabled()
+            and self.drafter.variable_verify
+            and 1 < num_tokens < self.uniform_decode_query_len
+        )
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        if hy4_plain_decode or hy4_partial_verify:
+            max_query_len = num_tokens // batch_descriptor_override.num_reqs
 
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
@@ -11817,6 +12211,7 @@ class GPUModelRunner(
                 # num_tokens == num_reqs which looks like a uniform decode batch to the
                 # dispatcher; but we actually want to capture a piecewise cudagraph
                 force_uniform_decode=uniform_decode,
+                hy4_exact_decode=hy4_plain_decode or hy4_partial_verify,
                 # `force_has_lora` is used for cudagraph capture; because LoRA is
                 # activated later in the context manager, but we need to know the
                 # LoRA state when determining the batch descriptor for capture
@@ -11971,7 +12366,9 @@ class GPUModelRunner(
                     for_cudagraph_capture=build_for_capture,
                     is_dummy_batch=True,
                     slot_mappings=slot_mappings_by_group,
-                    use_spec_decode=self.speculative_config is not None,
+                    use_spec_decode=(
+                        self.speculative_config is not None and not hy4_plain_decode
+                    ),
                     ddtree_parent_metadata=dummy_ddtree_parent_metadata,
                     cudagraph_capture_max_seq_len=(
                         batch_desc.attention_context_bucket
@@ -12100,6 +12497,33 @@ class GPUModelRunner(
                     is_dummy_run=True,
                 ),
             ):
+                if (
+                    attn_metadata is not None
+                    and uniform_decode
+                    and self._hy4_dfly_graphs_enabled()
+                ):
+                    from vllm.models.hy_v4_flash.sm70.cache import FlashMetadata
+
+                    assert isinstance(attn_metadata, dict)
+                    assert num_tokens_unpadded == num_tokens_padded
+                    for entry in attn_metadata.values():
+                        if isinstance(entry, FlashMetadata):
+                            entry.num_actual_tokens = num_tokens_unpadded
+                    if hy4_plain_decode:
+                        snapshot = self.drafter.plain_histories.get(num_reqs)
+                        if snapshot is None:
+                            snapshot = self.drafter.make_plain_snapshot(num_reqs)
+                        extra = get_forward_context().additional_kwargs
+                        extra["hy4_dfly_plain"] = snapshot
+                    else:
+                        graph = self.drafter.verify_graphs.get(num_tokens_unpadded)
+                        if graph is None:
+                            graph = self.drafter.make_verification_graph(
+                                num_tokens_unpadded, max_query_len
+                            )
+                        extra = get_forward_context().additional_kwargs
+                        extra["hy4_verify_graph"] = graph
+
                 _sm70_profile_trace(
                     "_dummy_run model forward enter num_tokens_padded=%s "
                     "runtime_mode=%s attn_metadata=%s skip_compiled=%s",
@@ -12540,11 +12964,46 @@ class GPUModelRunner(
         lm_peak = torch.accelerator.memory_stats(self.device).get(
             "allocated_bytes.all.peak", 0
         )
+        self.forward_profile_peak_increase = max(0, lm_peak - pre_lm_alloc)
+        self.prompt_profile_peak_increase = 0
+        tile = self._hy4_prompt_logprobs_tile()
+        if tile and get_pp_group().is_last_rank and not self.is_pooling_model:
+            # Include the live full-chunk hidden states, as in serving. Use
+            # the real LM head, TP gather, FP32 log-softmax and top-k kernels.
+            topk = self.model_config.max_logprobs
+            if topk < 0:
+                topk = self.model_config.get_vocab_size()
+            rows = min(tile, hidden_states.shape[0])
+            torch.accelerator.reset_peak_memory_stats(self.device)
+            self._compute_prompt_logprobs(
+                hidden_states[:rows],
+                topk,
+                torch.zeros(rows, device=self.device, dtype=torch.int64),
+            )
+            self._sync_device()
+            prompt_peak = torch.accelerator.memory_stats(self.device).get(
+                "allocated_bytes.all.peak", 0
+            )
+            self.prompt_profile_peak_increase = max(0, prompt_peak - pre_lm_alloc)
+            lm_peak = max(lm_peak, prompt_peak)
         self.language_profile_peak_increase = max(0, lm_peak - pre_lm_alloc)
         self.profile_torch_peak = max(pre_lm_peak, lm_peak)
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+        if self.speculative_config and self.speculative_config.method == "dfly":
+            torch.accelerator.reset_peak_memory_stats(self.device)
+            self.drafter.profile_eager()
+            self._sync_device()
+            draft_peak = torch.accelerator.memory_stats(self.device)[
+                "allocated_bytes.all.peak"
+            ]
+            self.draft_profile_peak_increase = max(0, draft_peak - pre_lm_alloc)
+            self.profile_torch_peak = max(self.profile_torch_peak, draft_peak)
+            logger.info(
+                "Hy4 DFly2 eager draft transient bytes: %d",
+                self.draft_profile_peak_increase,
+            )
         _sm70_profile_trace(
             "profile_run end elapsed_s=%.3f",
             time.perf_counter() - profile_start,
@@ -12607,6 +13066,12 @@ class GPUModelRunner(
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dfly"
+            and hasattr(self, "drafter")
+        ):
+            self.drafter.clear_graphs()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -12640,7 +13105,7 @@ class GPUModelRunner(
         logger.debug("Cleaned up profiling KV cache and CUDA graphs")
 
     @torch.inference_mode()
-    def profile_cudagraph_memory(self) -> int:
+    def profile_cudagraph_memory(self, *, measure_residency: bool = False) -> int:
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -12680,52 +13145,70 @@ class GPUModelRunner(
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
 
-            for mode, descs in capture_descs:
-                profile_descs = descs[:2]
-                mem_samples: list[int] = []
+            if measure_residency:
+                for mode, descs in capture_descs:
+                    self._capture_cudagraphs(descs, mode)
+                self._capture_hy4_draft_graphs(capture_descs)
+                self._capture_drafter_cudagraphs()
+            else:
+                for mode, descs in capture_descs:
+                    profile_descs = descs[:2]
+                    mem_samples: list[int] = []
 
-                for i, desc in enumerate(profile_descs):
-                    mem_before = torch.cuda.mem_get_info()[0]
-                    self._warmup_and_capture(
-                        desc,
-                        cudagraph_runtime_mode=mode,
-                        profile_seq_lens=(
-                            (
-                                desc.attention_context_bucket
-                                if desc.attention_context_bucket is not None
-                                else min(
-                                    self.max_model_len,
-                                    self.max_num_tokens // desc.num_tokens,
+                    for i, desc in enumerate(profile_descs):
+                        mem_before = torch.cuda.mem_get_info()[0]
+                        self._warmup_and_capture(
+                            desc,
+                            cudagraph_runtime_mode=mode,
+                            profile_seq_lens=(
+                                (
+                                    desc.attention_context_bucket
+                                    if desc.attention_context_bucket is not None
+                                    else min(
+                                        self.max_model_len,
+                                        self.max_num_tokens // desc.num_tokens,
+                                    )
                                 )
-                            )
-                            if mode == CUDAGraphMode.FULL and i == 0
-                            else None
-                        ),
-                        batch_descriptor_override=desc,
+                                if mode == CUDAGraphMode.FULL and i == 0
+                                else None
+                            ),
+                            batch_descriptor_override=desc,
+                        )
+                        torch.accelerator.synchronize()
+                        free_after = torch.cuda.mem_get_info()[0]
+                        mem_samples.append(mem_before - free_after)
+
+                    first_capture = mem_samples[0]
+                    # Use at least 1 MiB per graph for driver overhead
+                    per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
+
+                    shared_memory_estimate[mode] = first_capture
+                    per_graph_estimate[mode] = per_graph * (len(descs) - 1)
+
+                    logger.debug(
+                        "Estimated %s CUDA graph memory: "
+                        "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
+                        mode.name,
+                        first_capture / (1 << 20),
+                        len(descs),
+                        per_graph / (1 << 20),
                     )
-                    torch.accelerator.synchronize()
-                    free_after = torch.cuda.mem_get_info()[0]
-                    mem_samples.append(mem_before - free_after)
 
-                first_capture = mem_samples[0]
-                # Use at least 1 MiB per graph for driver overhead
-                per_graph = max(mem_samples[1] if len(mem_samples) > 1 else 0, 1 << 20)
-
-                shared_memory_estimate[mode] = first_capture
-                per_graph_estimate[mode] = per_graph * (len(descs) - 1)
-
-                logger.debug(
-                    "Estimated %s CUDA graph memory: "
-                    "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
-                    mode.name,
-                    first_capture / (1 << 20),
-                    len(descs),
-                    per_graph / (1 << 20),
-                )
+        if measure_residency:
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+            live_graphs = MemorySnapshot(device=self.device)
 
         set_cudagraph_capturing_enabled(False)
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
+        if measure_residency and self._hy4_dfly_graphs_enabled():
+            self.drafter.clear_graphs()
+        if measure_residency and current_platform.is_cuda():
+            # BLAS workspaces are cached by stream, independently of graph
+            # wrappers. Drop them after destroying the temporary graphs and
+            # before empty_cache, so real capture can allocate them once.
+            torch._C._cuda_clearCublasWorkspaces()
         all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
             BreakableCUDAGraphWrapper._all_instances
         )
@@ -12738,6 +13221,28 @@ class GPUModelRunner(
         self.maybe_remove_all_loras(self.lora_config)
         self._cleanup_profiling_kv_cache()
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+
+        if measure_residency:
+            after_cleanup = MemorySnapshot(device=self.device)
+            # Use the same driver baseline as the worker budget. Driver and
+            # allocator growth still present after cleanup is already charged
+            # there. Charge the entire released delta, conservatively including
+            # the tiny profiling KV cache rather than subtracting a mixed
+            # before-cache/after-cache baseline.
+            released = max(0, live_graphs.cuda_memory - after_cleanup.cuda_memory)
+            logger.info(
+                "CUDA graph profile bytes: live=%d cleaned=%d released=%d "
+                "live_allocated=%d cleaned_allocated=%d "
+                "live_reserved=%d cleaned_reserved=%d",
+                live_graphs.cuda_memory,
+                after_cleanup.cuda_memory,
+                released,
+                live_graphs.torch_allocated_memory,
+                after_cleanup.torch_allocated_memory,
+                live_graphs.torch_memory,
+                after_cleanup.torch_memory,
+            )
+            return released
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are
         # never replayed concurrently, so the pool overlays their memory.
@@ -12811,6 +13316,9 @@ class GPUModelRunner(
                 )
                 torch.accelerator.synchronize()
 
+            self._capture_hy4_draft_graphs(
+                self.cudagraph_dispatcher.get_capture_descs()
+            )
             self._capture_drafter_cudagraphs()
 
             # Capture encoder CUDA graphs if enabled
@@ -12818,6 +13326,8 @@ class GPUModelRunner(
                 self.encoder_cudagraph_manager.capture()
 
             torch.accelerator.synchronize()
+            if self._hy4_dfly_graphs_enabled():
+                torch.accelerator.empty_cache()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
@@ -12958,6 +13468,23 @@ class GPUModelRunner(
             )
             torch.accelerator.synchronize()
         self.maybe_remove_all_loras(self.lora_config)
+
+    def _capture_hy4_draft_graphs(self, capture_descs) -> None:
+        if not self._hy4_dfly_graphs_enabled():
+            return
+        if envs.VLLM_HY4_DFLY_GRAPHS != "both":
+            return
+        sizes = {
+            desc.num_tokens // self.uniform_decode_query_len
+            for mode, descs in capture_descs
+            for desc in descs
+            if mode == CUDAGraphMode.FULL
+            and desc.uniform
+            and desc.num_reqs is not None
+            and desc.num_tokens == desc.num_reqs * self.uniform_decode_query_len
+        }
+        self.drafter.capture_draft_graphs(sorted(sizes))
+        logger.info("Captured Hy4 DFly2 draft graph request counts %s", sorted(sizes))
 
     def _capture_drafter_cudagraphs(self) -> None:
         spec_config = self.speculative_config
@@ -13218,6 +13745,24 @@ class GPUModelRunner(
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, graph_query_len
         )
+        if self._hy4_dfly_graphs_enabled() and self.drafter.variable_verify:
+            for width in range(2, self.uniform_decode_query_len):
+                desc = BatchDescriptor(width, 1, uniform=True)
+                self.cudagraph_dispatcher.add_cudagraph_key(CUDAGraphMode.FULL, desc)
+                self.cudagraph_dispatcher.add_context_bucket_keys(desc)
+        if self._hy4_dfly_graphs_enabled() and (
+            self.drafter.gate is not None or self.drafter.confidence_mode != "off"
+        ):
+            max_rows = min(
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.compilation_config.max_cudagraph_capture_size,
+            )
+            for rows in range(1, max_rows + 1):
+                desc = BatchDescriptor(rows, rows, uniform=True)
+                self.cudagraph_dispatcher.add_cudagraph_key(CUDAGraphMode.FULL, desc)
+                if self.cudagraph_dispatcher.hy4_index_bypass_width:
+                    self.cudagraph_dispatcher.add_context_bucket_keys(desc)
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
         if (

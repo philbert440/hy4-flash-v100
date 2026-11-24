@@ -73,6 +73,7 @@ EagleModelTypes = Literal[
     DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
+    "dfly",
     "ngram",
     "medusa",
     "mlp_speculator",
@@ -463,6 +464,8 @@ class SpeculativeConfig:
         ]
         if self.draft_token_map is not None:
             factors.append(("draft_token_map_sha256", self.draft_token_map_sha256))
+        if self.method == "dfly":
+            factors.append(("dfly", self.num_speculative_tokens))
         if self.method == "dspark":
             factors.append(
                 ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
@@ -800,6 +803,64 @@ class SpeculativeConfig:
         # will be detected automatically if possible. If the speculative method
         # can not be detected, it will be considered as the "draft_model" by
         # default.
+
+        target = self.target_model_config
+        is_hy4 = (
+            target is not None
+            and getattr(getattr(target, "hf_text_config", None), "model_type", None)
+            == "hy_v4_flash"
+        )
+        if is_hy4 and self.method != "dfly":
+            raise ValueError("Hy4 Flash --speculative-config requires method='dfly'.")
+        if self.method == "dfly":
+            from vllm.models.hy_v4_flash.dfly_config import (
+                DRAFT_TOKENS,
+                validate_parallel_config,
+            )
+
+            if not is_hy4:
+                raise ValueError("method='dfly' requires a Hy4 Flash target.")
+            if self.target_parallel_config is None:
+                raise ValueError("method='dfly' requires a target parallel config.")
+            validate_parallel_config(self.target_parallel_config)
+            if self.num_speculative_tokens != DRAFT_TOKENS:
+                raise ValueError("method='dfly' requires num_speculative_tokens=5.")
+            if self.model not in (None, target.model):
+                raise ValueError("method='dfly' requires model=the target checkpoint.")
+            if self.draft_sample_method != "greedy":
+                raise ValueError("method='dfly' requires draft_sample_method='greedy'.")
+            if self.rejection_sample_method != "standard":
+                raise ValueError(
+                    "method='dfly' requires rejection_sample_method='standard'."
+                )
+            if self.draft_tensor_parallel_size not in (
+                None,
+                self.target_parallel_config.tensor_parallel_size,
+            ):
+                raise ValueError(
+                    "method='dfly' requires draft_tensor_parallel_size=target TP."
+                )
+            if self.quantization is not None or self.attention_backend is not None:
+                raise ValueError(
+                    "method='dfly' does not support draft quantization "
+                    "or attention_backend."
+                )
+            for name in (
+                "max_model_len", "kv_cache_dtype", "draft_load_config",
+                "revision",
+                "code_revision",
+                "moe_backend",
+                "index_share_for_mtp_iteration",
+            ):
+                if getattr(self, name) is not None:
+                    raise ValueError(
+                        f"method='dfly' does not support a separate {name}."
+                    )
+            self.model = target.model
+            self.draft_model_config = target
+            self.draft_parallel_config = self.target_parallel_config
+            self._resolve_local_argmax_reduction()
+            return self
 
         # infer method from user args
         # Check if the model field contains a custom module path (e.g., 'pkg.Mod')

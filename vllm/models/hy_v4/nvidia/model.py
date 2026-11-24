@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """HY V4 decoder and text backbone shared by Flash (vllm-project/vllm#68296)."""
 
 from typing import cast
@@ -124,6 +125,7 @@ class HYV4Model(nn.Module):
 
 class HYV4ForCausalLM(nn.Module):
     model_cls: type[HYV4Model]
+    _lm_head_cls = ParallelLMHead
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -133,7 +135,7 @@ class HYV4ForCausalLM(nn.Module):
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
+        self.lm_head = self._lm_head_cls(
             config.vocab_size,
             config.hidden_size,
             params_dtype=torch.float32,

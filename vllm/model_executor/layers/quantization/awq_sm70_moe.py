@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """SM70 AWQ MoE method backed by TurboMind GEMM kernels."""
 
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Final
 
@@ -59,6 +61,13 @@ from vllm.model_executor.layers.fused_moe.sm70.stages import execute_routed
 from vllm.model_executor.layers.quantization.awq_qpn_sm70 import (
     initialize_qpn_m1,
     use_qpn_m1,
+)
+from vllm.model_executor.layers.quantization.hy4_awq_union_sm70 import (
+    HY4_UNION_PLAN_INTS,
+    initialize_hy4_union,
+    run_hy4_experts4,
+    run_hy4_union,
+    use_hy4_union,
 )
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute,
@@ -529,16 +538,30 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
 
+        config = get_current_vllm_config_or_none()
+        stage_qzeros = (
+            w13_qweight.is_cuda
+            and config is not None
+            and config.model_config is not None
+            and config.model_config.hf_text_config.model_type == "hy_v4_flash"
+        )
+        # The compact conversion folds these checkpoint zero points into the
+        # scales. Keep them out of the expandable weight segments so deleting
+        # each layer's zero points cannot strand a sub-page hole between weights.
+        qzeros_device = "cpu" if stage_qzeros else w13_qweight.device
         w13_qzeros = Parameter(
             torch.empty(
                 num_experts,
                 num_groups_w13,
                 2 * intermediate_size_per_partition // self.pack_factor,
                 dtype=torch.int32,
+                device=qzeros_device,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w13_qzeros", w13_qzeros)
+        if stage_qzeros:
+            w13_qzeros._vllm_keep_on_cpu = True
         set_weight_attrs(w13_qzeros, extra_weight_attrs)
 
         w2_qzeros = Parameter(
@@ -547,13 +570,32 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
                 num_groups_w2,
                 hidden_size // self.pack_factor,
                 dtype=torch.int32,
+                device=qzeros_device,
             ),
             requires_grad=False,
         )
         layer.register_parameter("w2_qzeros", w2_qzeros)
+        if stage_qzeros:
+            w2_qzeros._vllm_keep_on_cpu = True
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
+        if stage_qzeros:
+            # Allocate the IPC-visible decode outputs together during model
+            # construction, before per-layer conversion starts trimming the cache.
+            self._allocate_output(layer, hidden_size, w13_qweight.device)
+
+    def _stage_qzeros(self, layer: RoutedExperts) -> None:
+        if not getattr(layer.w13_qzeros, "_vllm_keep_on_cpu", False):
+            return
+        device = layer.w13_qweight.device
+        # A cudaMalloc-backed staging allocation is released in full when the
+        # final layer-local references go away. It never bisects live weights.
+        with custom_ar_ipc_safe_allocation():
+            _set_parameter(layer, "w13_qzeros", layer.w13_qzeros.to(device))
+            _set_parameter(layer, "w2_qzeros", layer.w2_qzeros.to(device))
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        self._stage_qzeros(layer)
         align = self.group_size
         hidden_logical_size = int(layer.w13_qweight.shape[1])
         w13_logical_out = int(layer.w13_scales.shape[-1])
@@ -758,6 +800,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
         layer.sm70_awq_qwen38_qpn_m1 = initialize_qpn_m1(
             layer, _qwen38_active_grouped_layer_contract(layer, self.group_size)
         )
+        layer.sm70_awq_hy4_union = initialize_hy4_union(layer, self.group_size)
         w2_chunk_tokens = int(self.sm70_moe_policy.w2_chunk_tokens or 0)
         if w2_chunk_tokens not in (0, *_QWEN38_CHUNKED_W2_SUPPORTED_TOKENS):
             raise ValueError(
@@ -782,6 +825,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
         del layer.w2_qweight, layer.w2_scales, layer.w2_qzeros
+        del w13_qweight, w13_scales, w13_qzeros, w2_qweight, w2_scales, w2_qzeros
         # Release unused conversion blocks between layers instead of retaining
         # their high-water mark throughout model loading. Live prepared weights
         # and inference buffers are unaffected; this is not an inference hook.
@@ -803,6 +847,22 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
         if compact_metadata:
             logger.info_once("SM70 TP4 AWQ compact scale/zero metadata enabled.")
 
+    def _allocate_output(
+        self, layer: RoutedExperts, hidden_size: int, device: torch.device
+    ) -> None:
+        # Graph capture reuses this resident buffer as the routed input of the
+        # captured custom all_reduce_sum2, which must be CUDA-IPC exportable.
+        allocation = (
+            custom_ar_ipc_safe_allocation() if device.type == "cuda" else nullcontext()
+        )
+        with allocation:
+            layer._awq_moe_buf_output = torch.empty(
+                _persistent_max_tokens_for_runtime(self.sm70_moe_policy),
+                hidden_size,
+                dtype=torch.float16,
+                device=device,
+            )
+
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
         top_k = self.moe.experts_per_token
@@ -816,15 +876,8 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
             persistent_tokens,
             _DEFAULT_PERSISTENT_MAX_TOKENS,
         )
-        # Graph capture reuses this resident buffer as the routed input of the
-        # captured custom all_reduce_sum2, which must be CUDA-IPC exportable.
-        with custom_ar_ipc_safe_allocation():
-            layer._awq_moe_buf_output = torch.empty(
-                persistent_tokens,
-                layer.sm70_hidden_logical_size,
-                dtype=torch.float16,
-                device=device,
-            )
+        if not hasattr(layer, "_awq_moe_buf_output"):
+            self._allocate_output(layer, layer.sm70_hidden_logical_size, device)
         layer._awq_moe_buf_permuted_input = torch.empty(
             max_slots,
             layer.sm70_hidden_logical_size,
@@ -903,6 +956,14 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
         layer._awq_moe_buf_active_expert_offsets = torch.arange(
             max_slots + 1, dtype=torch.int32, device=device
         )
+        if getattr(layer, "sm70_awq_hy4_union", False):
+            layer._awq_moe_buf_hy4_plan = torch.empty(
+                HY4_UNION_PLAN_INTS, dtype=torch.int32, device=device
+            )
+            # EXPERTS4 shared-expert pair tickets, counted modulo 16 from zero.
+            layer._awq_moe_buf_hy4_e4_tickets = torch.zeros(
+                16, dtype=torch.int32, device=device
+            )
         ptr_row_bytes = int(layer.sm70_ptr_row_bytes)
         layer._awq_moe_buf_compact_w13_ptrs_w = torch.empty(
             top_k * ptr_row_bytes, dtype=torch.uint8, device=device
@@ -1200,6 +1261,79 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
         )
         return output
 
+    def _hy4_union_buffers(
+        self, layer: RoutedExperts, x: torch.Tensor, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        num_tokens = x.shape[0]
+        top_k = topk_ids.shape[1]
+        total_slots = num_tokens * top_k
+        use_resident = (
+            not _use_temporary_buffers_for_dummy_or_capture()
+            and num_tokens <= layer._awq_moe_buf_max_tokens
+            and total_slots <= layer._awq_moe_buf_max_slots
+        )
+        device = x.device
+        if use_resident:
+            output = layer._awq_moe_buf_output[:num_tokens]
+            intermediate = layer._awq_moe_buf_intermediate[:total_slots]
+            route_out = layer._awq_moe_buf_sorted_output[:total_slots]
+            plan = layer._awq_moe_buf_hy4_plan
+            topk_ids_buf = layer._awq_moe_buf_topk_ids[:num_tokens]
+        else:
+            output = torch.empty(
+                num_tokens,
+                layer.sm70_hidden_logical_size,
+                dtype=torch.float16,
+                device=device,
+            )
+            intermediate = torch.empty(
+                total_slots,
+                layer.sm70_intermediate_size,
+                dtype=torch.float16,
+                device=device,
+            )
+            route_out = torch.empty(
+                total_slots,
+                layer.sm70_w2_n_dim,
+                dtype=torch.float16,
+                device=device,
+            )
+            plan = torch.empty(
+                HY4_UNION_PLAN_INTS, dtype=torch.int32, device=device
+            )
+            topk_ids_buf = torch.empty(
+                num_tokens, top_k, dtype=torch.int32, device=device
+            )
+        if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
+            topk_ids_i32 = topk_ids
+        else:
+            topk_ids_buf.copy_(topk_ids, non_blocking=True)
+            topk_ids_i32 = topk_ids_buf
+        return output, intermediate, route_out, plan, topk_ids_i32
+
+    def apply_hy4_experts4(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_x: torch.Tensor,
+        shared_gate_up: torch.Tensor,
+        shared_down: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Routed and W8 shared expert outputs from the two EXPERTS4 launches.
+
+        Returns None when the union path does not admit these rows.
+        """
+        if not use_hy4_union(layer, x, topk_weights, topk_ids):
+            return None
+        *buffers, topk_ids_i32 = self._hy4_union_buffers(layer, x, topk_ids)
+        shared = run_hy4_experts4(
+            layer, *buffers, x, topk_ids_i32, topk_weights,
+            shared_x, shared_gate_up, shared_down,
+        )
+        return buffers[0], shared
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -1215,6 +1349,10 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
                 "SM70 AWQ MoE does not support apply_router_weight_on_input yet."
             )
 
+        if use_hy4_union(layer, x, topk_weights, topk_ids):
+            *buffers, topk_ids_i32 = self._hy4_union_buffers(layer, x, topk_ids)
+            run_hy4_union(layer, *buffers, x, topk_ids_i32, topk_weights)
+            return buffers[0]
         num_tokens = x.shape[0]
         top_k = topk_ids.shape[1]
         total_slots = num_tokens * top_k

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 import json
 import os
@@ -13,6 +14,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import ModelConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.quantization.awq import AWQConfig
@@ -163,13 +165,21 @@ def _construct_model(checkpoint_metadata, cpu_vllm, monkeypatch, tmp_path, awq):
     with torch.device("meta"), set_default_torch_dtype(torch.float16):
         candidate = HYV4FlashForCausalLM(vllm_config=cpu_vllm)
     assert len(candidate.model.layers) == 42
-    assert candidate.lm_head.weight.dtype == torch.float32
+    # The AWQ case mocks SM70 but keeps a CPU VllmConfig, so only an
+    # explicit storage override can select FP16 in this fixture.
+    expected_dtype = (
+        torch.float16
+        if awq and envs.HY4_DENSE_FP16_STORAGE and not envs.VLLM_BATCH_INVARIANT
+        else torch.float32
+    )
+    assert candidate.lm_head.weight.dtype == expected_dtype
     assert all(p.is_meta for p in candidate.parameters())
     if awq:
         quant = cpu_vllm.quant_config
         assert isinstance(quant, AWQConfig)
         assert (quant.weight_bits, quant.group_size, quant.zero_point) == (4, 32, True)
         for layer in candidate.model.layers[1:]:
+            assert layer.mlp.gate.weight.dtype == expected_dtype
             assert isinstance(layer.mlp.experts.quant_method, AWQSM70MoEMethod)
             assert layer.mlp.experts.w13_qweight.shape == (512, 1536, 384)
             assert layer.mlp.experts.w2_qweight.shape == (512, 1536, 192)

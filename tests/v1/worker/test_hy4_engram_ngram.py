@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 import torch
 
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.runtime.input_transfer import InputTransferSession
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -31,7 +33,7 @@ def make_runner() -> GPUModelRunner:
     runner.ngram_context_len = 2
     runner.ngram_eos_token_id = 99
     runner.enable_prompt_embeds = False
-    runner._sm70_async_staged_input_prep_active = False
+    runner._input_transfer = InputTransferSession()
     runner.ngram_context = Buffer((4, 2))
     runner.input_batch = SimpleNamespace(
         num_computed_tokens_cpu=np.array([0, 1, 3, 5], dtype=np.int32),

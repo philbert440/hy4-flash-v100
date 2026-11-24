@@ -1244,16 +1244,20 @@ def sanity_check_mm_encoder_outputs(
     )
 
 
-def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> int:
+def request_memory(
+    init_snapshot: MemorySnapshot, cache_config: CacheConfig, *, validate_free: bool = True
+) -> int:
     """
     Calculate the amount of memory required by vLLM, then validate
-    that the current amount of free memory is sufficient for that.
+    that the current amount of free memory is sufficient for that. A resident
+    budget uses a device-wide ceiling and already charges initial occupancy
+    against it, so that path defers validation to the measured budget.
     """
     requested_memory = math.ceil(
         init_snapshot.total_memory * cache_config.gpu_memory_utilization
     )
 
-    if init_snapshot.free_memory < requested_memory:
+    if validate_free and init_snapshot.free_memory < requested_memory:
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"

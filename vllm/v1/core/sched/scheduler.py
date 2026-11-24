@@ -199,6 +199,25 @@ class Scheduler(SchedulerInterface):
         # req_id -> Request
         self.requests: dict[str, Request] = {}
         speculative_config = vllm_config.speculative_config
+        self.hy4_dfly_gate_max_running = None
+        self.hy4_dfly_graph_sizes = None
+        self.hy4_dfly_variable_verify = False
+        if speculative_config is not None and speculative_config.method == "dfly":
+            from vllm.models.hy_v4_flash.dfly_gate import (
+                draft_max_running,
+                graph_draft_sizes,
+            )
+
+            from vllm.models.hy_v4_flash.profile import speed_setting
+
+            self.hy4_dfly_variable_verify = (
+                speed_setting("VLLM_HY4_DFLY_CONFIDENCE_MODE", vllm_config)
+                == "variable"
+            )
+            self.hy4_dfly_gate_max_running = draft_max_running()
+            self.hy4_dfly_graph_sizes = graph_draft_sizes(
+                vllm_config.compilation_config
+            )
         # req_id -> latest DDTree payload returned by a dflash_ddtree drafter.
         self.ddtree_payloads_by_req_id: dict[str, DDTreeDraftPayload] = {}
         self.dflash_ddtree_tree_verify = (
@@ -1749,6 +1768,41 @@ class Scheduler(SchedulerInterface):
             self._split_mtp_force_decode_once = True
             return self.schedule()
 
+        dfly_limit = self.hy4_dfly_gate_max_running
+        dfly_graph_sizes = self.hy4_dfly_graph_sizes
+        dfly_load = None
+        if dfly_limit is not None or dfly_graph_sizes is not None:
+            from vllm.models.hy_v4_flash.dfly_gate import draft_load_allowed
+
+            dfly_load = len(num_scheduled_tokens)
+            min_drafts = (
+                 1 if self.hy4_dfly_variable_verify and dfly_load == 1
+                 else self.num_spec_tokens
+            )
+            drop_dfly_drafts = (
+                not draft_load_allowed(dfly_load, dfly_limit, dfly_graph_sizes)
+                or scheduled_spec_decode_tokens.keys() != num_scheduled_tokens.keys()
+                or (
+                    dfly_graph_sizes is not None
+                    and any(
+                        num_scheduled_tokens[req] != len(ids) + 1
+                        or not min_drafts <= len(ids) <= self.num_spec_tokens
+                        for req, ids in scheduled_spec_decode_tokens.items()
+                    )
+                )
+            )
+        else:
+            drop_dfly_drafts = False
+        if scheduled_spec_decode_tokens and drop_dfly_drafts:
+            # Count every row in the completed schedule, including new,
+            # resumed and partial-prefill requests. Keep committed inputs
+            # and drop carry-over proposals for overloaded or mixed batches
+            # before publishing scheduler cursors. Extra reserved pages are
+            # owned by the same request and may be reused by its next step.
+            for req_id, ids in scheduled_spec_decode_tokens.items():
+                num_scheduled_tokens[req_id] -= len(ids)
+            scheduled_spec_decode_tokens.clear()
+
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         if _split_mtp_both_active and total_num_scheduled_tokens > 0:
@@ -1881,6 +1935,7 @@ class Scheduler(SchedulerInterface):
                 self.mixed_prefill_budget.budget if control_mixed_prefill else 0
             ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            hy4_dfly_draft_load=dfly_load,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
@@ -2516,6 +2571,11 @@ class Scheduler(SchedulerInterface):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
+                unused = getattr(model_runner_output, "hy4_unused_drafts", None)
+                if unused:
+                    # The worker verified fewer drafts than scheduled; the
+                    # rest still count as rejected for the token cursors.
+                    num_draft_tokens -= unused.get(req_id, 0)
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -2527,14 +2587,15 @@ class Scheduler(SchedulerInterface):
                 # the scheduled spec tokens count and so is similarly adjusted.
                 if request.num_output_placeholders > 0:
                     request.num_output_placeholders -= num_rejected
-                spec_decoding_stats = self.make_spec_decoding_stats(
-                    spec_decoding_stats,
-                    num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted,
-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                    request_id=req_id,
-                )
-                self._on_spec_decode_feedback(req_id, num_draft_tokens, num_accepted)
+                if num_draft_tokens:
+                    spec_decoding_stats = self.make_spec_decoding_stats(
+                        spec_decoding_stats,
+                        num_draft_tokens=num_draft_tokens,
+                        num_accepted_tokens=num_accepted,
+                        num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                        request_id=req_id,
+                    )
+                    self._on_spec_decode_feedback(req_id, num_draft_tokens, num_accepted)
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -2553,6 +2614,18 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                if (
+                    stopped
+                    and request.resumable
+                    and scheduled_spec_token_ids
+                    and not request.num_in_flight_tokens
+                ):
+                    # A stop can trim accepted outputs after the rejection
+                    # correction. Streaming may retain the cache and resume
+                    # with a new prompt, so trim the cursor before that update.
+                    request.num_computed_tokens = min(
+                        request.num_computed_tokens, request.num_tokens
+                    )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """
 Whenever you add an architecture to this page, please also update
 `tests/models/registry.py` with example HuggingFace models for it.
@@ -441,6 +442,10 @@ _MULTIMODAL_MODELS = {
     "Granite4VisionForConditionalGeneration": (
         "granite4_vision",
         "Granite4VisionForConditionalGeneration",
+    ),
+    "HYV4FlashVLForConditionalGeneration": (
+        "vllm.models.hy_v4_flash.nvidia.vl_model",
+        "HYV4FlashVLForConditionalGeneration",
     ),
     "H2OVLChatModel": ("h2ovl", "H2OVLChatModel"),
     "HunYuanVLForConditionalGeneration": (

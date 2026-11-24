@@ -1,3 +1,4 @@
+<!-- Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3). -->
 # Hy4-flash (validation support)
 
 ReVolta 0.2.0rc13 adds text-only support for [tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash) on four V100 32 GB GPUs. This is a validation release: Hy4-flash support is frozen at 0.2.0rc13, and later versions are not guaranteed to keep it working. Qwen3.8 Flash-Next behaviour is unchanged from 0.2.0rc12.
@@ -21,11 +22,11 @@ The default setup is the [AWQ g32 checkpoint](https://huggingface.co/leoncca/Hy4
 
 ```bash
 huggingface-cli download leoncca/Hy4-flash-AWQ-g32 \
-  --revision 6a6ab55577a64d74426696f78a847491b5a127d6 --local-dir /data/revolta/models/hy4-flash-awq-g32
+  --revision 6a6ab55577a64d74426696f78a847491b5a127d6 --local-dir ./hy4-flash-awq-g32
 
 export VLLM_USE_V2_MODEL_RUNNER=0 VLLM_SM70_QUANT_BACKEND=turbomind
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-vllm serve /data/revolta/models/hy4-flash-awq-g32 --served-model-name hy4-flash \
+vllm serve ./hy4-flash-awq-g32 --served-model-name hy4-flash \
   --tensor-parallel-size 4 --decode-context-parallel-size 4 \
   --dtype half --kv-cache-dtype fp8_ds_mla \
   --max-model-len 524288 --max-num-batched-tokens 2048 --max-num-seqs 4 \

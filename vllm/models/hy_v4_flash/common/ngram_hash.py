@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """Flash n-gram hashes. Lookback rows are ordered oldest to newest."""
 
 import torch
@@ -156,14 +157,23 @@ def hash_ngrams_triton(
     offsets: torch.Tensor,
     pad_token_id: int,
     num_actual_tokens: int,
+    *,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch the stateless hash for a packed batch on CUDA."""
     num_layers, max_ngram = multipliers.shape
     num_tokens = input_ids.numel()
     heads = primes.shape[1] // (max_ngram - 1)
-    output = input_ids.new_empty(
-        (num_layers, num_tokens, primes.shape[1]), dtype=torch.int32
-    )
+    shape = (num_layers, num_tokens, primes.shape[1])
+    if out is None:
+        out = input_ids.new_empty(shape, dtype=torch.int32)
+    elif (
+        out.shape != shape
+        or out.device != input_ids.device
+        or out.dtype != torch.int32
+        or not out.is_contiguous()
+    ):
+        raise ValueError("Invalid output buffer for the Engram hash kernel")
     if num_tokens:
         _hash_ids_kernel[(triton.cdiv(num_tokens, 32), num_layers)](
             input_ids,
@@ -174,7 +184,7 @@ def hash_ngrams_triton(
             multipliers,
             primes,
             offsets,
-            output,
+            out,
             num_tokens,
             num_actual_tokens,
             query_start_loc.numel() - 1,
@@ -186,4 +196,4 @@ def hash_ngrams_triton(
             BLOCK_H=triton.next_power_of_2(heads),
             num_warps=4,
         )
-    return output
+    return out

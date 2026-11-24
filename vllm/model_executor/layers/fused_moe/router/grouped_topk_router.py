@@ -270,6 +270,7 @@ class GroupedTopKRouter(BaseRouter):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.renormalize = renormalize
+        self.parallel_top16 = False
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
@@ -294,6 +295,20 @@ class GroupedTopKRouter(BaseRouter):
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute routing using grouped top-k."""
+        bias = self.e_score_correction_bias
+        if (
+            self.parallel_top16
+            and bias is not None
+            and router_logits.is_cuda
+            and router_logits.dtype == bias.dtype == torch.float32
+            and router_logits.shape[-1] == 512
+            and 1 <= router_logits.shape[0] <= 32
+            and router_logits.is_contiguous()
+            and bias.is_contiguous()
+        ):
+            return torch.ops.hy4_sm70.parallel_top16(
+                router_logits, bias, self.renormalize, self.routed_scaling_factor
+            )
 
         def valid_grouping() -> bool:
             # Check if num_experts is greater than num_expert_group

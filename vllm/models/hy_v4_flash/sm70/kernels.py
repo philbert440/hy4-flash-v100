@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 from math import gcd
 
 import torch
+
+from vllm.config.sm70_sparse import sparse_policy
 
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
@@ -12,14 +15,12 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
 from vllm.models.deepseek_v4.sm70.indexer import (
     _EPILOGUE_BLOCK_H,
     _EPILOGUE_BLOCK_K,
-    _PREFILL_TILE_MB,
     _RELU_BLOCK_N,
     _relu_weight_headsum,
 )
 from vllm.triton_utils import tl, triton
 
 _INDEX_PREFILL_GROUP_TILE = 65536
-_INDEX_PREFILL_GEMM_BUDGET = _PREFILL_TILE_MB * 2**18
 
 
 @triton.jit
@@ -181,12 +182,42 @@ def paged_attention(
     scale: float,
     latent: int,
     lse: torch.Tensor | None = None,
+    *,
+    tensor_cores: bool = False,
+    tensor_core_mode: int = 0,
 ) -> torch.Tensor:
     """Packed physical slots per query with FP32 softmax."""
     tokens, heads, dim = q.shape
     out = q.new_empty(
         (tokens, heads, latent), dtype=q.dtype if lse is None else torch.float32
     )
+    if (
+        tensor_cores
+        and q.is_cuda
+        and q.dtype == torch.float16
+        and latent == 512
+        and dim == 576
+        and q.stride(2) == 1
+        and q.stride(0) % 4 == q.stride(1) % 4 == 0
+        and q.storage_offset() % 4 == 0
+        and cache.dtype in (torch.uint8, torch.float16)
+        and cache.stride(2) == 1
+        and cache.stride(0) * cache.element_size() % 16 == 0
+        and cache.stride(1) * cache.element_size() % 16 == 0
+        and cache.storage_offset() * cache.element_size() % 16 == 0
+        and cache.shape[2] == (656 if cache.dtype == torch.uint8 else 576)
+        and counts.is_contiguous()
+        and slots.stride(1) == 1
+        and (
+            (lse is None and sinks is not None and sinks.dtype == torch.float32)
+            or (sinks is None and lse is not None and lse.is_contiguous())
+        )
+    ):
+        torch.ops.hy4_f7_attn.paged_prefill_sm70(
+            q, cache, slots, counts, sinks, out, lse, scale, tensor_core_mode
+        )
+        return out
+
     _paged_attention[(tokens, triton.cdiv(heads, 16))](
         q,
         cache,
@@ -270,6 +301,7 @@ def _index_scores(
     DECODE: tl.constexpr,
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
+    QUERY_WIDTH: tl.constexpr,
 ):
     # Weighted ReLU head-sum as in the DeepSeek V4 SM70 indexer, with
     # plain FP16 pages in place of software-decoded FP8 keys.
@@ -290,7 +322,7 @@ def _index_scores(
     if not DECODE or start < upper:
         logical_page = g // PAGE
         page = tl.load(
-            Table + row * stride_table + logical_page // PAGES_PER_BLOCK,
+            Table + (row // QUERY_WIDTH) * stride_table + logical_page // PAGES_PER_BLOCK,
             g < upper,
             other=0,
         )
@@ -332,6 +364,7 @@ def index_scores(
     group_topk: int = 0,
     world: int = 1,
     rank: int = 0,
+    query_width: int = 1,
 ) -> torch.Tensor:
     if logits is None:
         logits = q.new_empty((q.shape[0], groups), dtype=torch.float32)
@@ -361,6 +394,7 @@ def index_scores(
         lengths is not None,
         world,
         rank,
+        query_width,
         num_warps=4,
     )
     return logits
@@ -370,9 +404,44 @@ def index_prefill_key_rows(groups: int) -> int:
     return min(groups, _INDEX_PREFILL_GROUP_TILE)
 
 
-def index_prefill_gemm_elements(rows: int, key_rows: int) -> int:
+def index_prefill_gemm_elements(rows: int, key_rows: int, tile_mb: int) -> int:
     """Bound the FP32 GEMM output for rows of flattened query heads."""
-    return min(rows * key_rows, max(rows, _INDEX_PREFILL_GEMM_BUDGET))
+    return min(rows * key_rows, max(rows, tile_mb * 2**18))
+
+
+def index_prefill_workspace_specs(
+    rows: int,
+    groups: int,
+    heads: int,
+    dim: int,
+    tile_mb: int,
+    key_dtype: torch.dtype,
+    *,
+    logits_budget: int | None = None,
+) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+    """Reserve logits, gathered keys and GEMM output together.
+
+    Profiling bounds logits by the chunk budget, including room for at least
+    one row. Size the raw GEMM buffer before tile rounding so it also covers
+    the different tile widths used by shorter chunks and contexts.
+    """
+    logits = rows * groups
+    if logits_budget is not None:
+        logits = max(groups, min(logits, logits_budget))
+    key_rows = index_prefill_key_rows(groups)
+    return (
+        ((logits,), torch.float32),
+        ((key_rows, dim), key_dtype),
+        ((index_prefill_gemm_elements(rows * heads, key_rows, tile_mb),),
+         torch.float32),
+    )
+
+
+def allocate_index_prefill_scratch(
+    device: torch.device,
+    specs: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+) -> tuple[torch.Tensor, ...]:
+    return tuple(torch.empty(shape, dtype=dtype, device=device) for shape, dtype in specs)
 
 
 @triton.jit
@@ -459,16 +528,22 @@ def index_prefill_scores(
     *,
     world: int = 1,
     rank: int = 0,
+    tile_mb: int | None = None,
 ) -> torch.Tensor:
+    if tile_mb is None:
+        tile_mb = sparse_policy().value("indexer_prefill_tile_mb")
     rows, heads, dim = q.shape
     q2 = q.flatten(0, 1)
-    key_rows = index_prefill_key_rows(groups)
-    score_cols = index_prefill_gemm_elements(rows * heads, key_rows) // (rows * heads)
+    logits, keys, score_buf = allocate_index_prefill_scratch(
+        q.device,
+        index_prefill_workspace_specs(rows, groups, heads, dim, tile_mb, pool.dtype),
+    )
+    logits = logits.view(rows, groups)
+    key_rows = keys.shape[0]
+    score_cols = score_buf.numel() // q2.shape[0]
     if score_cols < key_rows:
         score_cols = score_cols // _RELU_BLOCK_N * _RELU_BLOCK_N or score_cols
     block_h = gcd(heads, _EPILOGUE_BLOCK_H)
-    keys = pool.new_empty((key_rows, dim))
-    logits = q.new_empty((rows, groups), dtype=torch.float32)
     # The final group in the output can still be open, so only gather keys
     # visible to at least one row. Convert the bound to rank-local group IDs.
     upper = ((first + rows - 1) // ratio + world - 1 - rank) // world
@@ -491,8 +566,10 @@ def index_prefill_scores(
             key_tile = keys[col : min(col + score_cols, live)]
             # As in the DeepSeek V4 SM70 cuBLAS scorer, fold heads into M.
             # Keep the GEMM output in FP32 for the top-k score comparison.
-            scores = torch.mm(q2, key_tile.t(), out_dtype=torch.float32)
-            width = scores.shape[1]
+            width = key_tile.shape[0]
+            # The epilogue expects contiguous rows even in a short final tile.
+            scores = score_buf[: q2.shape[0] * width].view(q2.shape[0], width)
+            torch.mm(q2, key_tile.t(), out=scores, out_dtype=torch.float32)
             _index_prefill_epilogue[(rows, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
                 scores,
                 weights,

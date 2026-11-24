@@ -60,6 +60,7 @@ from vllm.runtime_resources import runtime_resources_for
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.cuda_allocator import effective_allocator_config, scoped_allocator_config
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import (
@@ -75,6 +76,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.memory_budget import GPU_STARTUP_MARGIN_BYTES, available_kv_bytes
 from vllm.v1.worker.utils import (
     configure_attention_workspace,
     is_residual_scattered_for_sp,
@@ -498,9 +500,7 @@ class Worker(WorkerBase):
         # Runtime allocator settings reset omitted options such as rounding and
         # garbage collection. Preserve the complete config, including the newer
         # alias; PyTorch gives the legacy variable precedence even when empty.
-        conf = os.environ.get(
-            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
-        )
+        conf = effective_allocator_config()
         scoped_conf, count = re.subn(
             r"(^|,)\s*max_split_size_mb\s*:\s*\d+",
             lambda match: f"{match.group(1)}max_split_size_mb:{max_split_size_mb}",
@@ -509,11 +509,8 @@ class Worker(WorkerBase):
         if not count:
             scoped_conf = f"{conf}," if conf else ""
             scoped_conf += f"max_split_size_mb:{max_split_size_mb}"
-        set_allocator_settings(scoped_conf)
-        try:
+        with scoped_allocator_config(set_allocator_settings, scoped_conf):
             yield
-        finally:
-            set_allocator_settings(conf)
 
     @instrument(span_name="Init device")
     def init_device(self):
@@ -580,7 +577,11 @@ class Worker(WorkerBase):
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
-            self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            self.requested_memory = request_memory(
+                init_snapshot,
+                self.cache_config,
+                validate_free=not self._uses_resident_kv_budget(),
+            )
             # Reuse the worker's one-time capacity/admission snapshot. Optional
             # attention workspace policies must not probe free memory per call.
             runtime_resources_for(self.vllm_config)["gpu_memory_budget_bytes"] = int(
@@ -685,6 +686,110 @@ class Worker(WorkerBase):
         )
         return max(0, activation_peak)
 
+    def _uses_resident_kv_budget(self) -> bool:
+        return (
+            not self.use_v2_model_runner
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+            and getattr(
+                getattr(getattr(self, "model_config", None), "hf_text_config", None),
+                "model_type",
+                None,
+            )
+            == "hy_v4_flash"
+        )
+
+    def _budget_resident_kv(
+        self, resident: MemorySnapshot, graph_bytes: int, transient_bytes: int
+    ) -> int:
+        margin = GPU_STARTUP_MARGIN_BYTES
+        budget = available_kv_bytes(
+            resident,
+            self.cache_config.gpu_memory_utilization,
+            graph_bytes,
+            transient_bytes,
+            margin,
+        )
+        self.peak_activation_memory = transient_bytes
+        self.cudagraph_memory_estimate = graph_bytes
+        self.available_kv_cache_memory_bytes = budget
+        weights = int(self.model_runner.model_memory_usage)
+        logger.info(
+            "GPU resident startup budget bytes: total=%d requested=%d "
+            "init_used=%d init_torch_allocated=%d init_non_torch=%d "
+            "resident=%d weights=%d warmup_live=%d idle_reserved=%d non_torch=%d "
+            "graph=%d forward_peak=%d prompt_peak=%d transient=%d margin=%d kv=%d",
+            resident.total_memory,
+            self.requested_memory,
+            self.init_snapshot.cuda_memory,
+            self.init_snapshot.torch_allocated_memory,
+            self.init_snapshot.non_torch_memory,
+            resident.cuda_memory,
+            weights,
+            resident.torch_allocated_memory - weights
+            - self.init_snapshot.torch_allocated_memory,
+            resident.torch_memory - resident.torch_allocated_memory,
+            resident.non_torch_memory,
+            graph_bytes,
+            self.model_runner.forward_profile_peak_increase,
+            self.model_runner.prompt_profile_peak_increase,
+            transient_bytes,
+            margin,
+            budget,
+        )
+        if budget <= 0:
+            resolution = "Reduce the maximum batch shape."
+            if self.cache_config.gpu_memory_utilization < 1.0:
+                resolution = "Reduce the batch shape or increase gpu_memory_utilization."
+            raise RuntimeError(
+                f"GPU cannot honor gpu_memory_utilization="
+                f"{self.cache_config.gpu_memory_utilization}: requested ceiling "
+                f"{self.requested_memory} bytes leaves {budget} bytes for KV cache "
+                "after resident, graph, transient, and margin charges. "
+                f"{resolution}"
+            )
+        return budget
+
+    def _check_resident_kv_budget(self) -> None:
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
+        idle = MemorySnapshot(device=self.device)
+        largest_free_block = max(
+            (
+                block["size"]
+                for segment in torch.cuda.memory_snapshot()
+                if segment["device"] == self.device.index
+                for block in segment["blocks"]
+                if block["state"] == "inactive"
+            ),
+            default=0,
+        )
+        # Pool sizing already withheld the margin for startup variance. The
+        # post-warmup check protects the profiled peak and the physical share
+        # outside the requested ceiling, including when that share is zero.
+        unrequested = idle.total_memory - self.requested_memory
+        required_free = self.peak_activation_memory + unrequested
+        logger.info(
+            "GPU resident startup check bytes: free=%d required_free=%d "
+            "allocated=%d reserved=%d idle_reserved=%d largest_free_block=%d "
+            "non_torch=%d",
+            idle.free_memory,
+            required_free,
+            idle.torch_allocated_memory,
+            idle.torch_memory,
+            idle.torch_memory - idle.torch_allocated_memory,
+            largest_free_block,
+            idle.non_torch_memory,
+        )
+        if idle.free_memory < required_free:
+            raise RuntimeError(
+                "GPU cannot honor the requested utilization after warmup: "
+                f"{idle.free_memory} bytes free, {required_free} required "
+                f"({self.peak_activation_memory} for the profiled request peak "
+                f"and {unrequested} outside the requested ceiling). "
+                "Lower gpu_memory_utilization or the maximum batch shape."
+            )
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -775,6 +880,7 @@ class Worker(WorkerBase):
             logger.info(msg)
             return kv_cache_memory_bytes
 
+        use_resident_budget = self._uses_resident_kv_budget()
         # The first forward triggers torch.compile, and a cold compile (cache
         # miss) is not steady-state serving: on a 27B NVFP4 model on a 48 GB
         # card it added 1.85 GiB of torch peak (inductor autotuning, AOT
@@ -819,6 +925,15 @@ class Worker(WorkerBase):
             # profiling but still perform the real capture in warmup.
             cudagraph_memory_estimate = 0
             if (
+                use_resident_budget
+                and not self.model_config.enforce_eager
+                and self.vllm_config.compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE
+            ):
+                cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory(
+                    measure_residency=True
+                )
+            elif (
                 graph_policy(self.vllm_config).estimate_graph_memory
                 and current_platform.is_cuda()
                 and self.vllm_config.compilation_config.cudagraph_mode
@@ -840,6 +955,13 @@ class Worker(WorkerBase):
                         "SM70 graph memory reserve before KV allocation: %.2f GiB",
                         cudagraph_memory_estimate / 2**30,
                     )
+
+        if use_resident_budget:
+            return self._budget_resident_kv(
+                profile_result.after_profile,
+                cudagraph_memory_estimate,
+                max(0, profile_torch_peak - profile_result.before_profile.torch_peak),
+            )
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (
@@ -1075,15 +1197,52 @@ class Worker(WorkerBase):
         if hasattr(self.model_runner, "_warmup_sm70_aux_kernels"):
             self.model_runner._warmup_sm70_aux_kernels()
 
+        check_residency = (
+            self._uses_resident_kv_budget()
+            and self.cache_config.kv_cache_memory_bytes is None
+        )
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
-            cuda_graph_memory_bytes = self.model_runner.capture_model()
+            before_capture = MemorySnapshot(device=self.device) if check_residency else None
+            try:
+                # Hy4's capture-time boundary dispatch resolves profile
+                # defaults against the DFly2 model configuration.
+                if (
+                    envs.VLLM_HY4_PROFILE in ("fast11", "fast13", "fast14")
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "dfly"
+                ):
+                    with set_current_vllm_config(self.vllm_config):
+                        cuda_graph_memory_bytes = self.model_runner.capture_model()
+                else:
+                    cuda_graph_memory_bytes = self.model_runner.capture_model()
+            except torch.OutOfMemoryError as exc:
+                if not check_residency:
+                    raise
+                raise RuntimeError(
+                    "GPU startup ran out of memory during graph capture. "
+                    "Lower gpu_memory_utilization or the maximum batch shape."
+                ) from exc
+            if before_capture is not None:
+                after_capture = MemorySnapshot(device=self.device)
+                cuda_graph_memory_bytes = (
+                    after_capture.cuda_memory - before_capture.cuda_memory
+                )
+                logger.info(
+                    "GPU real graph capture bytes: driver=%d non_torch=%d "
+                    "allocated=%d reserved=%d",
+                    cuda_graph_memory_bytes,
+                    after_capture.non_torch_memory - before_capture.non_torch_memory,
+                    after_capture.torch_allocated_memory
+                    - before_capture.torch_allocated_memory,
+                    after_capture.torch_memory - before_capture.torch_memory,
+                )
         self.cudagraph_memory_bytes = cuda_graph_memory_bytes
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
             hasattr(self, "cudagraph_memory_estimate")
-            and self.cudagraph_memory_estimate > 0
+            and (check_residency or self.cudagraph_memory_estimate > 0)
         ):
             GiB = lambda b: round(b / GiB_bytes, 2)
             diff = abs(cuda_graph_memory_bytes - self.cudagraph_memory_estimate)
@@ -1096,8 +1255,10 @@ class Worker(WorkerBase):
                 100 * diff / max(cuda_graph_memory_bytes, 1),
             )
 
-        if self.cache_config.kv_cache_memory_bytes is None and hasattr(
-            self, "peak_activation_memory"
+        if (
+            not check_residency
+            and self.cache_config.kv_cache_memory_bytes is None
+            and hasattr(self, "peak_activation_memory")
         ):
             # Suggests optimal kv cache memory size if we rely on
             # memory_profiling to guess the kv cache memory size which
@@ -1195,6 +1356,9 @@ class Worker(WorkerBase):
 
         self._trim_qsa_warmup_cache()
         self._release_compile_artifact_records()
+
+        if check_residency:
+            self._check_resident_kv_budget()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
@@ -1434,7 +1598,9 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        if _INLINE_DRAFTS and get_pp_group().is_last_rank:
+        if (
+            _INLINE_DRAFTS or getattr(self.model_runner, "hy4_inline_drafts", False)
+        ) and get_pp_group().is_last_rank:
             v41_trace.mark("s_enter")
             output = self.model_runner.sample_tokens(grammar_output)
             if isinstance(output, ModelRunnerOutput):

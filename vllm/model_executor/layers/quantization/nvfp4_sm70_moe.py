@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """Native SM70 TurboMind NVFP4 MoE for validated expert shapes.
 
 The route keeps ModelOpt W4A16_NVFP4 expert weights packed. It combines the

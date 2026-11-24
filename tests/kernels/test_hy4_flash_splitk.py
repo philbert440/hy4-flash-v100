@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 import os
 
@@ -194,3 +195,34 @@ def test_fp8_main_kv_matches_reference(device, heads, width, lengths):
         assert torch.equal(output[-1], torch.zeros_like(output[-1]))
         error = (output[:-1] - expected[:-1]).flatten(1).norm(dim=-1) / norm
         assert torch.all(error < 6e-4), error
+
+
+@pytest.mark.parametrize("requests", [2, 4])
+def test_batched_cache_reads_match_per_request(device, requests):
+    from types import SimpleNamespace
+
+    from vllm.models.hy_v4_flash.sm70.attention import HYV4FlashAttention
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    rows = requests * 6
+    gen = torch.Generator().manual_seed(451)
+    q = torch.randn(rows, 1, 576, generator=gen).half().to(device)
+    cache = torch.randn(2, 64, 576, generator=gen).half().to(device)
+    counts = torch.arange(1, rows + 1, device=device, dtype=torch.int32)
+    indices = torch.arange(64, device=device, dtype=torch.int32).expand(rows, -1)
+    model = SimpleNamespace(
+        _decode_workspace_specs=decode_workspace_specs(rows, 1, 64, 512),
+        scaling=1 / 16,
+        kv_lora_rank=512,
+    )
+    init_workspace_manager(torch.device(device))
+    try:
+        args = (q, cache, indices, counts, torch.zeros(1, device=device),
+                None, SimpleNamespace(verification=None))
+        expected = HYV4FlashAttention._read_cache(model, *args, verification_width=6)
+        actual = HYV4FlashAttention._read_cache(
+            model, *args, verification_width=6, batch_verification=True
+        )
+        assert torch.equal(actual, expected)
+    finally:
+        reset_workspace_manager()

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 from types import SimpleNamespace
 
@@ -45,7 +46,7 @@ def make_case(tmp_path, *, model_shape=False):
     with torch.no_grad():
         reference.multi_head_embedding.embedding.weight.copy_(source.float())
         reference.unified_pre_gamma.uniform_(0.5, 1.5)
-        for item in reference.unified_per_hc_scales:
+        for item in reference.unified_per_hc_scales.parameters():
             item.uniform_(-0.2, 0.2)
         for module in [
             *reference.lookup_per_head_norms,
@@ -109,7 +110,7 @@ def make_layer(reference, path, layout, vllm_config, tp, rank, monkeypatch):
             dst.weight.copy_(src.weight)
         layer.unified_pre_gamma.copy_(reference.unified_pre_gamma)
         for dst, src in zip(
-            layer.unified_per_hc_scales, reference.unified_per_hc_scales
+            layer.unified_per_hc_scales, reference.unified_per_hc_scales.parameters()
         ):
             dst.copy_(src)
     return layer
@@ -217,7 +218,8 @@ def test_cuda_whole_layer_against_cpu(tmp_path, monkeypatch):
     cfg.device_config.device_type = "cuda"
     gpu = make_layer(reference, path, layout, cfg, 1, 0, monkeypatch).cuda()
     context = SimpleNamespace(
-        no_compile_layers=cfg.compilation_config.static_forward_context
+        no_compile_layers=cfg.compilation_config.static_forward_context,
+        runtime_resources={},
     )
     with override_forward_context(context):
         actual = gpu(hidden.cuda(), hashes.cuda()).cpu()
@@ -275,7 +277,8 @@ def test_cuda_fused_engram_against_transformers(
     pad = tokens == layout.pad_token_id
     expected = checkpoint_reference(reference, source, hidden, ngrams, pad)
     context = SimpleNamespace(
-        no_compile_layers=cfg.compilation_config.static_forward_context
+        no_compile_layers=cfg.compilation_config.static_forward_context,
+        runtime_resources={},
     )
     streams = hidden.cuda()
     ids = hashes[:num_tokens].to(device="cuda", dtype=torch.int32)

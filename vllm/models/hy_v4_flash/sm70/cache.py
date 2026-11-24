@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 from dataclasses import dataclass
-from typing import ClassVar, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
 from torch import nn
@@ -25,6 +26,9 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+if TYPE_CHECKING:
+    from .verification import VerificationForward
+
 POOL_PAGE = 64
 
 
@@ -44,6 +48,20 @@ class IndexPoolDecodeWorkspace(NamedTuple):
     sorted_groups: torch.Tensor
     sort_order: torch.Tensor
 
+    @classmethod
+    def allocate(cls, rows, ratio, dim, groups, history, device, *, pos_dims=1):
+        return cls(
+            torch.empty((rows, ratio, dim), dtype=torch.float32, device=device),
+            torch.empty(
+                rows if pos_dims == 1 else (rows, pos_dims),
+                dtype=torch.int64, device=device,
+            ),
+            torch.empty((rows, groups), dtype=torch.float32, device=device),
+            torch.empty((rows, history), dtype=torch.float32, device=device),
+            *(torch.empty((rows, history), dtype=torch.int64, device=device)
+              for _ in range(3)),
+        )
+
 
 @dataclass
 class FlashMetadata(AttentionMetadata):
@@ -56,6 +74,7 @@ class FlashMetadata(AttentionMetadata):
     decode: bool
     counts: torch.Tensor | None
     index_workspace: IndexPoolDecodeWorkspace | None
+    verification: "VerificationForward | None" = None
 
 
 class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
@@ -84,25 +103,11 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
                 groups = cdiv(model.max_model_len, ratio)
                 # Every sparse layer in this attention group uses the same scratch.
                 dcp = vllm_config.parallel_config.decode_context_parallel_size > 1
-                topk_shape = (
-                    (rows, history) if not dcp and groups > history + 1 else (rows, 0)
-                )
-                self.index_workspace = IndexPoolDecodeWorkspace(
-                    torch.empty(
-                        (rows, ratio, kv_cache_spec.head_size),
-                        dtype=torch.float32,
-                        device=device,
-                    ),
-                    torch.empty(rows, dtype=torch.int64, device=device),
-                    torch.empty(
-                        (rows, groups if topk_shape[1] else 0),
-                        dtype=torch.float32,
-                        device=device,
-                    ),
-                    torch.empty(topk_shape, dtype=torch.float32, device=device),
-                    torch.empty(topk_shape, dtype=torch.int64, device=device),
-                    torch.empty(topk_shape, dtype=torch.int64, device=device),
-                    torch.empty(topk_shape, dtype=torch.int64, device=device),
+                select = not dcp and groups > history + 1
+                self.index_workspace = IndexPoolDecodeWorkspace.allocate(
+                    rows, ratio, kv_cache_spec.head_size,
+                    groups if select else 0, history if select else 0, device,
+                    pos_dims=3 if getattr(model, "uses_mrope", False) else 1,
                 )
             else:
                 self.counts = torch.empty(rows, dtype=torch.int32, device=device)

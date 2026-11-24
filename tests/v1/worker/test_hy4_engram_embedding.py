@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 from types import SimpleNamespace
 
@@ -116,7 +117,8 @@ def test_cuda_gather_matches_cpu(tmp_path, monkeypatch):
     gpu.load_from_safetensors(str(path), "table.weight")
     ids = torch.tensor([[1, 6, 12, 24], [-1, -1, -1, -1]], dtype=torch.int32)
     ctx = SimpleNamespace(
-        no_compile_layers=cuda_config.compilation_config.static_forward_context
+        no_compile_layers=cuda_config.compilation_config.static_forward_context,
+        runtime_resources={},
     )
     static_ids = ids.cuda()
     with override_forward_context(ctx):

@@ -787,9 +787,71 @@ if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
   target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
 endif()
 
-# Keep the accepted SM70 chunked sampler in a separate wheel module so adding
-# it does not perturb the quality- and speed-frozen primary vllm._C module.
 if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
+  set(VLLM_SM70_HY4_MOE_SRC
+    "csrc/sm70_turbomind/ops/hy4_f7_hc_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_boundary_router_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_boundary_ar_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_f7_moe_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_dense_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_skinny_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_awq_union_moe_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_w8_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_parallel_top16_sm70.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_SM70_HY4_MOE_SRC}"
+    CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+  define_extension_target(
+    _sm70_hy4_moe_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "${VLLM_SM70_HY4_MOE_SRC}"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    USE_SABI 3
+    WITH_SOABI)
+
+  set(VLLM_SM70_HY4_ATTN_SRC
+    "csrc/sm70_turbomind/ops/hy4_attn_prep_sm70.cu"
+    "csrc/sm70_turbomind/ops/hy4_attn_out_sm70.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_SM70_HY4_ATTN_SRC}"
+    CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+  define_extension_target(
+    _sm70_hy4_attn_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "${VLLM_SM70_HY4_ATTN_SRC}"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    USE_SABI 3
+    WITH_SOABI)
+
+  set(VLLM_SM70_HY4_NEXT_SRC
+    "csrc/sm70_turbomind/ops/hy4_idx_pool_sm70.cu"
+  )
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_SM70_HY4_NEXT_SRC}"
+    CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+  define_extension_target(
+    _sm70_hy4_next_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "${VLLM_SM70_HY4_NEXT_SRC}"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    USE_SABI 3
+    WITH_SOABI)
+
+  # HY4_IDX_TC IndexPool decode scoring. Kept out of the _sm70_hy4* name space
+  # so the W8 GPTQ cache key (which digests _sm70_hy4*.so) does not change.
+  set(VLLM_SM70_IDX_TC_SRC "csrc/sm70_turbomind/ops/hy4_idx_tc_sm70.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_SM70_IDX_TC_SRC}"
+    CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+  define_extension_target(
+    _sm70_idx_tc_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "${VLLM_SM70_IDX_TC_SRC}"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    USE_SABI 3
+    WITH_SOABI)
+
+  # Keep the SM70 sampler separate from the primary vllm._C module.
   set(VLLM_SM70_SAMPLER_FRAGMENT_SRCS
     "csrc/sm70_turbomind/ops/sm70_top20_philox_fragment.cpp"
     "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu"

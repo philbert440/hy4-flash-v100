@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """Dense FFN and MoE blocks for HY V4 (NVIDIA)."""
 
 import torch
@@ -64,6 +65,8 @@ class HYV4FeedForward(nn.Module):
 class HYV4MoEFused(nn.Module):
     """HY V4 sigmoid routing with shared and clamped routed experts."""
 
+    _gate_cls = GateLinear
+
     def __init__(
         self,
         config: HYV4FlashConfig,
@@ -78,7 +81,7 @@ class HYV4MoEFused(nn.Module):
         self.n_routed_experts = config.num_experts
         top_k = config.num_experts_per_tok
         intermediate_size = config.expert_hidden_dim
-        self.gate = GateLinear(
+        self.gate = self._gate_cls(
             config.hidden_size,
             config.num_experts,
             bias=False,
@@ -135,14 +138,15 @@ class HYV4MoEFused(nn.Module):
             swiglu_limit=moe_swiglu_limit,
         )
 
+    def _router_logits(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gate(x)[0]
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts); the gate stores fp32 weights
-        # and emits fp32 logits, so no explicit upcast is needed here.
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._router_logits(hidden_states)
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits

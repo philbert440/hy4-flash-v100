@@ -927,6 +927,64 @@ DINLINE P sm70_push_reduce_partition(P (&values)[4], int owner) {
   }
 }
 
+template <typename P, int ngpus>
+DINLINE void sm70_tp4_push_transfer(RankData push_buffers, char* local_storage,
+                                    int rank, int epoch_offset, int offset,
+                                    P input, P (&peer_values)[ngpus]) {
+  constexpr int packed_stride = kSm70Tp4PushAllreduceMaxBytes / sizeof(P);
+  P value = input;
+#pragma unroll
+  for (int element = 0; element < P::size; ++element) {
+    sm70_push_escape_sentinel(value.data[element]);
+  }
+
+#pragma unroll
+  for (int destination_rank = 0; destination_rank < ngpus;
+       ++destination_rank) {
+    auto* destination_base = const_cast<char*>(
+        reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
+    void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
+                        (epoch_offset + rank * packed_stride) * sizeof(P);
+    sm70_push_store_volatile_16b(value, destination, offset);
+  }
+
+  while (true) {
+    bool has_empty_slot = false;
+#pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      const void* source =
+          local_storage + kSm70Tp4PushAllreduceSignalBytes +
+          (epoch_offset + source_rank * packed_stride) * sizeof(P);
+      sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
+#pragma unroll
+      for (int element = 0; element < P::size; ++element) {
+        has_empty_slot |=
+            sm70_push_is_sentinel(peer_values[source_rank].data[element]);
+      }
+    }
+    if (!has_empty_slot) break;
+  }
+
+}
+
+template <typename P, int ngpus>
+DINLINE void sm70_tp4_push_clear(char* local_storage, int epoch_offset,
+                                 int offset) {
+  constexpr int packed_stride = kSm70Tp4PushAllreduceMaxBytes / sizeof(P);
+  P empty;
+#pragma unroll
+  for (int element = 0; element < P::size; ++element) {
+    *reinterpret_cast<uint16_t*>(&empty.data[element]) =
+        kSm70Tp4PushAllreduceSentinel;
+  }
+#pragma unroll
+  for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+    void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
+                   (epoch_offset + source_rank * packed_stride) * sizeof(P);
+    sm70_push_store_volatile_16b(empty, source, offset);
+  }
+}
+
 template <int ngpus, bool RotatedOrder = false>
 __global__ void __launch_bounds__(1024, 1)
     sm70_cross_device_reduce_1stage_push(RankData push_buffers,
@@ -947,39 +1005,10 @@ __global__ void __launch_bounds__(1024, 1)
 
   for (int offset = first_offset; offset < packed_size;
        offset += gridDim.x * blockDim.x) {
-    P value = reinterpret_cast<const P*>(input)[offset];
-#pragma unroll
-    for (int element = 0; element < P::size; ++element) {
-      sm70_push_escape_sentinel(value.data[element]);
-    }
-
-#pragma unroll
-    for (int destination_rank = 0; destination_rank < ngpus;
-         ++destination_rank) {
-      auto* destination_base = const_cast<char*>(
-          reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
-      void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
-                          (epoch_offset + rank * packed_stride) * sizeof(P);
-      sm70_push_store_volatile_16b(value, destination, offset);
-    }
-
     P peer_values[ngpus];
-    while (true) {
-      bool has_empty_slot = false;
-#pragma unroll
-      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
-        const void* source =
-            local_storage + kSm70Tp4PushAllreduceSignalBytes +
-            (epoch_offset + source_rank * packed_stride) * sizeof(P);
-        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
-#pragma unroll
-        for (int element = 0; element < P::size; ++element) {
-          has_empty_slot |=
-              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
-        }
-      }
-      if (!has_empty_slot) break;
-    }
+    sm70_tp4_push_transfer(push_buffers, local_storage, rank, epoch_offset,
+                           offset, reinterpret_cast<const P*>(input)[offset],
+                           peer_values);
 
     P reduced;
     if constexpr (RotatedOrder) {
@@ -994,18 +1023,7 @@ __global__ void __launch_bounds__(1024, 1)
     }
     reinterpret_cast<P*>(output)[offset] = reduced;
 
-    P empty;
-#pragma unroll
-    for (int element = 0; element < P::size; ++element) {
-      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
-          kSm70Tp4PushAllreduceSentinel;
-    }
-#pragma unroll
-    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
-      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
-                     (epoch_offset + source_rank * packed_stride) * sizeof(P);
-      sm70_push_store_volatile_16b(empty, source, offset);
-    }
+    sm70_tp4_push_clear<P, ngpus>(local_storage, epoch_offset, offset);
   }
 
   __syncthreads();

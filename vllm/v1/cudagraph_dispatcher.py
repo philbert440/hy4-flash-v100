@@ -4,6 +4,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
 
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.execution_policy import flash_v100_policy, graph_policy
 from vllm.forward_context import (
@@ -91,6 +92,22 @@ class CudagraphDispatcher:
             if not self.vllm_config.speculative_config
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
+        self.hy4_index_bypass_width = 0
+        from vllm.models.hy_v4_flash.profile import speed_setting
+
+        if (
+            vllm_config.model_config is not None
+            and speed_setting("VLLM_HY4_INDEX_BYPASS", vllm_config)
+        ):
+            text_config = vllm_config.model_config.hf_text_config
+            if text_config.model_type == "hy_v4_flash":
+                width = (
+                    text_config.compressed_indexer_group_topk
+                    * text_config.compressed_indexer_compress_ratio
+                )
+                if vllm_config.model_config.max_model_len > width:
+                    self.hy4_index_bypass_width = width
+
         self._graph_plan = resolve_graph_plan(vllm_config)
         from vllm.runtime_resources import runtime_resources_for
 
@@ -277,6 +294,9 @@ class CudagraphDispatcher:
         self,
         batch_descriptor: BatchDescriptor,
     ) -> tuple[int, ...]:
+        if self.hy4_index_bypass_width and batch_descriptor.uniform:
+            return (self.hy4_index_bypass_width,)
+
         from vllm.sm70_profiles.cudagraph_policy import context_buckets_for_descriptor
 
         return context_buckets_for_descriptor(
@@ -288,7 +308,7 @@ class CudagraphDispatcher:
 
     @property
     def has_attention_context_buckets(self) -> bool:
-        return bool(self._active_context_buckets())
+        return bool(self.hy4_index_bypass_width or self._active_context_buckets())
 
     @property
     def has_attention_context_specialization(self) -> bool:
@@ -296,7 +316,7 @@ class CudagraphDispatcher:
             self.has_attention_context_buckets or self.sm70_fp8_kv_batch_context_routing
         )
 
-    def _add_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
+    def add_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
         """Add attention-specialized graphs for this exact descriptor."""
         context_buckets = self._context_buckets_for_descriptor(batch_descriptor)
         for bucket in context_buckets:
@@ -313,7 +333,7 @@ class CudagraphDispatcher:
                 ),
             )
 
-    def _get_context_bucket_descriptor(
+    def get_context_bucket_descriptor(
         self,
         batch_descriptor: BatchDescriptor,
         attention_context_len: int | None,
@@ -398,7 +418,7 @@ class CudagraphDispatcher:
                     batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
                 self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)
                 if cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL:
-                    self._add_context_bucket_keys(batch_desc)
+                    self.add_context_bucket_keys(batch_desc)
 
         # if decode cudagraph mode is FULL, and we don't already have mixed
         # mode full cudagraphs then add them here.
@@ -427,7 +447,7 @@ class CudagraphDispatcher:
                     bs, True, num_active_loras > 0, num_active_loras
                 )
                 self.add_cudagraph_key(CUDAGraphMode.FULL, batch_descriptor)
-                self._add_context_bucket_keys(batch_descriptor)
+                self.add_context_bucket_keys(batch_descriptor)
 
         self.keys_initialized = True
 
@@ -508,7 +528,7 @@ class CudagraphDispatcher:
 
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
-            batch_desc_to_check = self._get_context_bucket_descriptor(
+            batch_desc_to_check = self.get_context_bucket_descriptor(
                 batch_desc, attention_context_len
             )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:

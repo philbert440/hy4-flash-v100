@@ -97,11 +97,19 @@ def create_step_profiler(
         if role == "proposer"
         else ("mtp", "dflash", "dspark")
     )
+    model = getattr(config, "model_config", None)
+    hy4_target = (
+        role == "runner"
+        and model is not None
+        and getattr(model.hf_text_config, "model_type", None) == "hy_v4_flash"
+    )
     return StepProfiler(
         enabled=bool(
             policy.enabled
-            and spec is not None
-            and spec.method in methods
+            and (
+                (spec is not None and spec.method in methods)
+                or (hy4_target and (spec is None or spec.method == "dfly"))
+            )
             and getattr(device, "type", device) == "cuda"
             and (role != "runner_v2" or is_last_pp_rank)
         ),

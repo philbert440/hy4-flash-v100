@@ -1,0 +1,16 @@
+A0 Hy4-flash port attribution
+
+ReVolta is derived from 1CatAI/1Cat-vLLM (1Cat-vLLM), which is derived from
+vllm-project/vllm. The Python import name remains "vllm". The upstream engine
+code uses Apache License 2.0, subject to the component exceptions below.
+
+Sources:
+  https://github.com/1CatAI/1Cat-vLLM
+  https://github.com/vllm-project/vllm
+Copyright contributors to the vLLM project; 1Cat AI and contributors.
+ReVolta modifications are maintained by Leon under Apache License 2.0,
+except where an existing component license applies. See LICENSE.
+
+This inventory covers retained source and configured build dependencies.
+It does not grant rights to model weights or other installed dependencies.
+Per-file copyright, license and modification notices remain authoritative.

@@ -247,6 +247,7 @@ class SchedulerOutput:
     mixed_prefill_tokens: int = 0
     mixed_decode_tokens: int = 0
     mixed_prefill_budget: int = 0
+    hy4_dfly_draft_load: int | None = None
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

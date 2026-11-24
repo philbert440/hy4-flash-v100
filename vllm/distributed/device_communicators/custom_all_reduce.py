@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import cast
 
 import regex as re
@@ -26,6 +25,7 @@ from vllm.distributed.device_communicators.collective_provider import (
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.cuda_allocator import effective_allocator_config, scoped_allocator_config
 
 try:
     ops.meta_size()
@@ -43,18 +43,6 @@ _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
 )
 
 
-def _get_effective_allocator_conf() -> str:
-    """Return the allocator config selected by PyTorch on CUDA.
-
-    PyTorch 2.10 prefers the legacy CUDA-specific variable whenever it is
-    present, even when its value is empty, and otherwise falls back to the
-    unified accelerator variable.
-    """
-    if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
-        return os.environ["PYTORCH_CUDA_ALLOC_CONF"]
-    return os.environ.get("PYTORCH_ALLOC_CONF", "")
-
-
 @contextmanager
 def _disable_expandable_segments_for_cuda_ipc(active: bool, purpose: str | None = None):
     """Keep CUDA-IPC graph buffers on cudaMalloc-backed allocations.
@@ -70,7 +58,7 @@ def _disable_expandable_segments_for_cuda_ipc(active: bool, purpose: str | None 
     is cudaMalloc-backed. Allocations made *before* the window are not.
     Yields whether expandable segments were disabled.
     """
-    allocator_conf = _get_effective_allocator_conf()
+    allocator_conf = effective_allocator_config()
     disabled_conf, replacements = _EXPANDABLE_SEGMENTS_TRUE_PATTERN.subn(
         r"\1False", allocator_conf
     )
@@ -87,12 +75,16 @@ def _disable_expandable_segments_for_cuda_ipc(active: bool, purpose: str | None 
                 "IPC compatibility.",
                 purpose,
             )
-        torch.cuda.memory._set_allocator_settings(disabled_conf)
-    try:
+    set_allocator_settings = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if set_allocator_settings is None:
+        set_allocator_settings = torch.cuda.memory._set_allocator_settings
+    allocation = (
+        scoped_allocator_config(set_allocator_settings, disabled_conf)
+        if should_disable
+        else nullcontext()
+    )
+    with allocation:
         yield should_disable
-    finally:
-        if should_disable:
-            torch.cuda.memory._set_allocator_settings(allocator_conf)
 
 
 # CUDA driver enums (cuda.h): CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE

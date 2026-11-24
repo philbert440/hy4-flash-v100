@@ -15,8 +15,8 @@ def _patch_allocator_settings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     settings: list[str] = []
     monkeypatch.setattr(custom_all_reduce.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
-        custom_all_reduce.torch.cuda.memory,
-        "_set_allocator_settings",
+        custom_all_reduce.torch._C,
+        "_accelerator_setAllocatorSettings",
         settings.append,
     )
     return settings
@@ -78,8 +78,8 @@ def test_cuda_ipc_capture_preserves_allocator_state(
                 allocator_state[key] = int(value)
 
     monkeypatch.setattr(
-        custom_all_reduce.torch.cuda.memory,
-        "_set_allocator_settings",
+        custom_all_reduce.torch._C,
+        "_accelerator_setAllocatorSettings",
         set_allocator_settings,
     )
 

@@ -1178,6 +1178,60 @@ if TYPE_CHECKING:
     making the server model-name agnostic. Useful for proxy/gateway scenarios."""
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+    VLLM_HY4_DFLY_GRAPHS: str = "off"
+    VLLM_HY4_PROFILE: str = "reference"
+    VLLM_HY4_EXPERT_UNION_FOLD: bool = False
+    HY4_W8_ATTN: bool = False
+    HY4_W8_O_PROJ: bool = False
+    HY4_W8_LATENT: bool = False
+    HY4_W8_SHARED: bool = False
+    HY4_W8_MLP: bool = False
+    HY4_W8_INDEXER: bool = False
+    HY4_W8_UV: bool = False
+    HY4_W8_SHARED_GROUP_SIZE: int = 128
+    VLLM_HY4_DFLY_HEAD: str = "fp32"
+    VLLM_HY4_DFLY_VERIFY_INDEX: str = "batched"
+    VLLM_HY4_DFLY_GATE: str = "off"
+    VLLM_HY4_DFLY_GATE_THRESHOLD: float = 0.9
+    VLLM_HY4_DFLY_GATE_MAX_RUNNING: int = 0
+    VLLM_HY4_DFLY_LOG_CONFIDENCE: bool = False
+    VLLM_HY4_DFLY_CONFIDENCE_MODE: str = "off"
+    VLLM_HY4_DFLY_CONFIDENCE_THRESHOLD: float = 0.5
+    VLLM_HY4_INDEX_BYPASS: bool = False
+    VLLM_HY4_PARALLEL_ROUTER: bool = False
+    HY4_F7_HC_BRIDGE: bool = False
+    HY4_W8_HEAD: bool = False
+    HY4_W8_HEAD_GROUP_SIZE: int = 128
+    HY4_DENSE_FP16_STORAGE: bool = False
+    HY4_DENSE_SKINNY: bool = False
+    HY4_BOUNDARY_AR_NORM: bool = False
+    HY4_NODES_BRIDGE_RMS: bool = False
+    HY4_BRIDGE_SPLIT_BIG_MIX: bool = False
+    HY4_NODES_ENGRAM: bool = False
+    HY4_PREP_SPLIT_W8: bool = False
+    HY4_EXPERTS3_RING: bool = False
+    HY4_EXPERTS4_SHARED: bool = False
+    HY4_EXPERTS4B_VERIFY: bool = False
+    HY4_DREV2_DEFER_DRAFTS: bool = False
+    HY4_DCONF2_LATE_WIDTH: bool = False
+    HY4_IDX_TC: bool = False
+    HY4_DREV2_WIDE: bool = False
+    HY4_DREV2_WIDE_NORM: bool = False
+    HY4_BOUNDARY_ROUTER_INPUT: bool = False
+    HY4_F7_MOE_FUSE: bool = False
+    VLLM_HY4_POSITION_FUSION: bool = False
+    VLLM_HY4_EXPERT_KERNEL: str = "current"
+    VLLM_HY4_EXPERT_UNION_MIN_ROWS: str = "2"
+    HY4_ATTNCORE_PREP: bool = False
+    HY4_ATTNCORE_SPLIT: bool = False
+    HY4_ATTN3_W8_MERGE: bool = False
+    HY4_ATTN3_FP8_PRMT: bool = False
+    HY4_ATTN4B_SWA_TENSOR: bool = False
+    HY4_PF_ATTN_TC: bool = False
+    HY4_F7_ATTN_PREP: bool = False
+    HY4_F7_ATTN_OUT: bool = False
+    HY4_PF_ATTN_FIX: int = 0
+    HY4_F7_IDX_FUSE: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
@@ -18146,6 +18200,591 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Whether to wait for all requests to drain before sending the "
             "scaling command in elastic EP."
         ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    # Opt into Hy4 DFly2 verifier capture, optionally including the draft.
+    "VLLM_HY4_DFLY_GRAPHS": env_var(
+        env_with_choices("VLLM_HY4_DFLY_GRAPHS", "off", ["off", "verify", "both"]),
+        description="Capture Hy4 DFly2 verification and optional draft CUDA graphs.",
+        category="configuration",
+        declared_default="off",
+        effective_default="'off'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    # Row-wise is the acceptance reference against one-row decode; batched serves.
+    "VLLM_HY4_EXPERT_UNION_FOLD": env_var(
+        lambda: os.environ.get("VLLM_HY4_EXPERT_UNION_FOLD", "0") == "1",
+        description="Fold the Hy4 SM70 expert plan and reduction into the default kernels.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_ATTN": env_var(
+        lambda: os.environ.get("HY4_W8_ATTN", "0") == "1",
+        description="Pack Hy4 attention prep projections as symmetric grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_O_PROJ": env_var(
+        lambda: os.environ.get("HY4_W8_O_PROJ", "0") == "1",
+        description="Pack Hy4 attention output projections as symmetric grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_LATENT": env_var(
+        lambda: os.environ.get("HY4_W8_LATENT", "0") == "1",
+        description="Pack Hy4 routed expert latent projections as grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_SHARED": env_var(
+        lambda: os.environ.get("HY4_W8_SHARED", "0") == "1",
+        description="Pack Hy4 shared expert projections as symmetric grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_MLP": env_var(
+        lambda: os.environ.get("HY4_W8_MLP", "0") == "1",
+        description="Pack Hy4 dense MLP projections as symmetric grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_INDEXER": env_var(
+        lambda: os.environ.get("HY4_W8_INDEXER", "0") == "1",
+        description="Pack Hy4 IndexPool projections as symmetric grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_UV": env_var(
+        lambda: os.environ.get("HY4_W8_UV", "0") == "1",
+        description="Pack Hy4 absorbed value projections as symmetric grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_SHARED_GROUP_SIZE": env_var(
+        lambda: int(os.environ.get("HY4_W8_SHARED_GROUP_SIZE", "128")),
+        description="Choose the int8 weight group size for Hy4 shared experts.",
+        category="configuration",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_PROFILE": env_var(
+        env_with_choices(
+            "VLLM_HY4_PROFILE",
+            "reference",
+            [
+                "reference",
+                "fast",
+                "fast2",
+                "fast3",
+                "fast4",
+                "fast5",
+                "fast6",
+                "fast7",
+                "fast8",
+                "fast9",
+                "fast10",
+                "fast11",
+                "fast13",
+                "fast14",
+            ],
+        ),
+        description="Select the Hy4 speed profile.",
+        category="configuration",
+        declared_default="reference",
+        effective_default="'reference'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_DFLY_HEAD": env_var(
+        env_with_choices("VLLM_HY4_DFLY_HEAD", "fp32", ["fp32", "fp16", "int8"]),
+        description="Select the Hy4 DFly2 proposal head.",
+        category="configuration",
+        declared_default="fp32",
+        effective_default="fp32",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_DFLY_VERIFY_INDEX": env_var(
+        env_with_choices(
+            "VLLM_HY4_DFLY_VERIFY_INDEX", "batched", ["rowwise", "batched"]
+        ),
+        description="Batch the Hy4 DFly2 uniform verification index and cache read.",
+        category="configuration",
+        declared_default="batched",
+        effective_default="'batched'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_DFLY_GATE": env_var(
+        env_with_choices("VLLM_HY4_DFLY_GATE", "off", ["off", "ewma"]),
+        description="Enable the Hy4 DFly2 acceptance gate.",
+        category="configuration",
+        declared_default="off",
+        effective_default="'off'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_DFLY_GATE_THRESHOLD": env_var(
+        lambda: float(os.getenv("VLLM_HY4_DFLY_GATE_THRESHOLD", "0.9")),
+        description="Pause drafting below this many accepted proposals per step.",
+        category="configuration",
+        declared_default="0.9",
+        effective_default="0.9",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_DFLY_GATE_MAX_RUNNING": env_var(
+        lambda: int(os.getenv("VLLM_HY4_DFLY_GATE_MAX_RUNNING", "0")),
+        description="Hard Hy4 DFly2 drafting request cap (0 disables the cap).",
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    # Confidence gating is startup-only because it changes captured graph keys.
+    "VLLM_HY4_DFLY_CONFIDENCE_MODE": env_var(
+        env_with_choices(
+            "VLLM_HY4_DFLY_CONFIDENCE_MODE", "off", ["off", "skip", "variable"]
+        ),
+        description="Use the Hy4 DFly2 confidence head for C1 proposal gating.",
+        category="configuration",
+        declared_default="off",
+        effective_default="'off'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_DFLY_CONFIDENCE_THRESHOLD": env_var(
+        lambda: float(os.getenv("VLLM_HY4_DFLY_CONFIDENCE_THRESHOLD", "0.5")),
+        description="Minimum DFly2 confidence probability for proposing a token.",
+        category="configuration",
+        declared_default="0.5",
+        effective_default="0.5",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_DFLY_LOG_CONFIDENCE": env_var(
+        lambda: bool(int(os.getenv("VLLM_HY4_DFLY_LOG_CONFIDENCE", "0"))),
+        description="Log Hy4 DFly2 confidence logits and acceptance for calibration.",
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_POSITION_FUSION": env_var(
+        lambda: bool(int(os.getenv("VLLM_HY4_POSITION_FUSION", "0"))),
+        description="Fuse small-row text Hy4 attention rotation and layout on SM70.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_HEAD": env_var(
+        lambda: bool(int(os.getenv("HY4_W8_HEAD", "0"))),
+        description="Use the SM70 W8 target LM head for small Hy4 logits batches.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_HEAD_GROUP_SIZE": env_var(
+        lambda: int(os.getenv("HY4_W8_HEAD_GROUP_SIZE", "128")),
+        description="Weight group size for the Hy4 W8 target LM head (64 or 128).",
+        category="configuration",
+        declared_default="128",
+        effective_default="128",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_DENSE_FP16_STORAGE": env_var(
+        lambda: bool(int(os.getenv("HY4_DENSE_FP16_STORAGE", "0"))),
+        description="Store Hy4-flash SM70 router and target LM head weights in FP16.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_DENSE_SKINNY": env_var(
+        lambda: bool(int(os.getenv("HY4_DENSE_SKINNY", "0"))),
+        description="Use the SM70 skinny kernel for Hy4-flash dense projections.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_F7_MOE_FUSE": env_var(
+        lambda: bool(int(os.getenv("HY4_F7_MOE_FUSE", "0"))),
+        description="Fuse Hy4-flash latent and shared expert projections on SM70.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_BOUNDARY_AR_NORM": env_var(
+        lambda: bool(int(os.getenv("HY4_BOUNDARY_AR_NORM", "0"))),
+        description="Fuse the Hy4 SM70 TP4 reduction and sandwich normalization.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_BRIDGE_SPLIT_BIG_MIX": env_var(
+        lambda: bool(int(os.getenv("HY4_BRIDGE_SPLIT_BIG_MIX", "0"))),
+        description="Split the Hy4 SM70 iHC bridge into partials and a wide mix.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_NODES_BRIDGE_RMS": env_var(
+        lambda: bool(int(os.getenv("HY4_NODES_BRIDGE_RMS", "0"))),
+        description="Fuse small-batch Hy4 SM70 inter-block input norms into iHC.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_PREP_SPLIT_W8": env_var(
+        lambda: bool(int(os.getenv("HY4_PREP_SPLIT_W8", "0"))),
+        description="Split packed SM70 attention prep into four graph nodes for up to eight rows.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_EXPERTS3_RING": env_var(
+        lambda: bool(int(os.getenv("HY4_EXPERTS3_RING", "0"))),
+        description="Run the folded Hy4 SM70 routed experts (1-4 tokens) with the EXPERTS3 "
+        "software-pipelined W13/W2 kernels (loads one K pair ahead); same output bits.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_EXPERTS4_SHARED": env_var(
+        lambda: bool(int(os.getenv("HY4_EXPERTS4_SHARED", "0"))),
+        description="Run the Hy4 SM70 shared expert (W8 g32) inside the EXPERTS3 ring "
+        "W13/W2 launches for 1-4 tokens instead of on the aux stream; same output bits.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_EXPERTS4B_VERIFY": env_var(
+        lambda: bool(int(os.getenv("HY4_EXPERTS4B_VERIFY", "0"))),
+        description="Extend HY4_EXPERTS4_SHARED to 5-8 token MoE batches (the DFly2 "
+        "six-row verify): routed experts and the W8 shared expert in the two ring "
+        "launches instead of the union schedule plus the aux stream; same output bits.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_DREV2_WIDE_NORM": env_var(
+        lambda: bool(int(os.getenv("HY4_DREV2_WIDE_NORM", "0"))),
+        description="The bit-exact part of HY4_DREV2_WIDE: admit 5-8 rows on the "
+        "boundary all-reduce RMSNorm and fused bridge RMSNorm only. Restart-only.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_DREV2_WIDE": env_var(
+        lambda: bool(int(os.getenv("HY4_DREV2_WIDE", "0"))),
+        description="Admit 5-8 rows (the DFly2 six-row verify) on the Hy4 SM70 "
+        "boundary router GEMV, boundary all-reduce RMSNorm, packed Engram and fused "
+        "bridge RMSNorm paths, which otherwise stop at 4 rows. Restart-only.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_DREV2_DEFER_DRAFTS": env_var(
+        lambda: bool(int(os.getenv("HY4_DREV2_DEFER_DRAFTS", "0"))),
+        description="Hy4 DFly2 with synchronous scheduling: return placeholder draft ids "
+        "and copy the drafted ids into the next verify's input ids on the device, so "
+        "scheduling and input preparation overlap the draft graph. Same token ids. "
+        "Off for structured output, penalties and bad words. Restart-only.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_DCONF2_LATE_WIDTH": env_var(
+        lambda: bool(int(os.getenv("HY4_DCONF2_LATE_WIDTH", "0"))),
+        description="Hy4 DFly2 confidence gating with deferred drafts at one request: "
+        "the drafter launches every picker and copies the confidence to the host "
+        "asynchronously, the engine schedules the full draft count, and the worker "
+        "reads the confidence when the next step arrives and shrinks the scheduled "
+        "drafts to the confidence cut. Same widths and token ids. Restart-only.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_IDX_TC": env_var(
+        lambda: bool(int(os.getenv("HY4_IDX_TC", "0"))),
+        description="Use SM70 Tensor Core IndexPool decode scores and native history selection.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_NODES_ENGRAM": env_var(
+        lambda: bool(int(os.getenv("HY4_NODES_ENGRAM", "0"))),
+        description="Pack the small-batch Hy4 SM70 Engram projections and fuse their consumer.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_BOUNDARY_ROUTER_INPUT": env_var(
+        lambda: bool(int(os.getenv("HY4_BOUNDARY_ROUTER_INPUT", "0"))),
+        description="Read FP16 activations directly for the Hy4 FP32 router.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_F7_HC_BRIDGE": env_var(
+        lambda: bool(int(os.getenv("HY4_F7_HC_BRIDGE", "0"))),
+        description="Fuse Hy4-flash independent hyper-connections on SM70 (incompatible with DFly2).",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_PARALLEL_ROUTER": env_var(
+        lambda: bool(int(os.getenv("VLLM_HY4_PARALLEL_ROUTER", "0"))),
+        description="Use the parallel SM70 Hy4 sigmoid top-16 selector.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_INDEX_BYPASS": env_var(
+        lambda: bool(int(os.getenv("VLLM_HY4_INDEX_BYPASS", "0"))),
+        description="Skip Hy4 sparse history selection in bounded decode graphs.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_EXPERT_KERNEL": env_var(
+        env_with_choices("VLLM_HY4_EXPERT_KERNEL", "current", ["current", "union"]),
+        description="Select the routed-expert kernel for Hy4-flash on SM70.",
+        category="configuration",
+        declared_default="current",
+        effective_default="current",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_HY4_EXPERT_UNION_MIN_ROWS": env_var(
+        env_with_choices("VLLM_HY4_EXPERT_UNION_MIN_ROWS", "2", ["1", "2"]),
+        description="Minimum rows for the Hy4-flash grouped expert kernel.",
+        category="configuration",
+        declared_default="2",
+        effective_default="2",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_ATTNCORE_PREP": env_var(
+        lambda: bool(int(os.getenv("HY4_ATTNCORE_PREP", "0"))),
+        description="Fuse Hy4 SM70 prep with FP8 cache writes and slots.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_ATTN3_W8_MERGE": env_var(
+        lambda: bool(int(os.getenv("HY4_ATTN3_W8_MERGE", "0"))),
+        description="Use the narrower W8 attention merge for up to eight rows.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_ATTN3_FP8_PRMT": env_var(
+        lambda: bool(int(os.getenv("HY4_ATTN3_FP8_PRMT", "0"))),
+        description="Use a byte-permute decoder in Hy4 FP8 split-K attention.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_PF_ATTN_TC": env_var(
+        lambda: bool(int(os.getenv("HY4_PF_ATTN_TC", "0"))),
+        description="Use the SM70 Tensor Core paged attention reader for Hy4 prefill.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_ATTN4B_SWA_TENSOR": env_var(
+        lambda: bool(int(os.getenv("HY4_ATTN4B_SWA_TENSOR", "0"))),
+        description="Use the SM70 Tensor Core reader for Hy4 FP8 SWA at two to four rows.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_ATTNCORE_SPLIT": env_var(
+        lambda: bool(int(os.getenv("HY4_ATTNCORE_SPLIT", "0"))),
+        description="Use Tensor Core splits in short single-row Hy4 SM70 decode.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_F7_ATTN_PREP": env_var(
+        lambda: bool(int(os.getenv("HY4_F7_ATTN_PREP", "0"))),
+        description="Fuse Hy4-flash SM70 attention input projections, norms, rotary, and absorbed Q.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_F7_ATTN_OUT": env_var(
+        lambda: bool(int(os.getenv("HY4_F7_ATTN_OUT", "0"))),
+        description="Fuse Hy4-flash SM70 attention split-K cache read, merge, absorbed V, and gate.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_PF_ATTN_FIX": env_var(
+        lambda: int(os.getenv("HY4_PF_ATTN_FIX", "0")),
+        description=(
+            "Numerical mode bits for the HY4_PF_ATTN_TC prefill reader: 1 adds each "
+            "PV tile to the FP32 output with round-to-nearest, 8 does so for every "
+            "four-key PV step, 2 does the same for "
+            "each QK step, 4 normalizes with div.full.f32 like the Triton reader."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_F7_IDX_FUSE": env_var(
+        lambda: bool(int(os.getenv("HY4_F7_IDX_FUSE", "0"))),
+        description="Fuse Hy4-flash SM70 sparse IndexPool update, pooling, rotary, and long-context query prep.",
         category="configuration",
         declared_default="False",
         effective_default="False",

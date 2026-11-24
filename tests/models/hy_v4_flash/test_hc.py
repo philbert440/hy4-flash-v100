@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 import pytest
 import torch
@@ -51,6 +52,15 @@ def test_eager_ihc_against_transformers(dtype):
     torch.testing.assert_close(
         head(scattered), ref_head(expected_post.unsqueeze(0)).squeeze(0), atol=0, rtol=0
     )
+
+    # Interleave a discarded span with another pass over the same inputs.
+    rejected = (streams + 2).flip(0)
+    unused, rejected_gates = pre(rejected)
+    head(post(unused, rejected, rejected_gates))
+    replay, replay_gates = pre(streams)
+    assert torch.equal(mixed, replay)
+    assert torch.equal(gates, replay_gates)
+    assert torch.equal(head(scattered), head(post(sublayer, streams, replay_gates)))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

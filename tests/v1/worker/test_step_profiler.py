@@ -40,6 +40,25 @@ def make_profiler(role, *, interval=2, enabled=True, messages=None):
     return result
 
 
+@pytest.mark.parametrize("method", [None, "dfly"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_hy4_profile_opt_in_for_matched_baselines(method, enabled):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="hy_v4_flash")
+        ),
+        observability_config=ObservabilityConfig(
+            step_profiler=StepProfilerConfig(enabled=enabled, interval=1)
+        ),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
+    )
+    for role in ("runner", "runner_v2", "proposer"):
+        profiler = create_step_profiler(
+            config, torch.device("cuda"), role=role, logger=SimpleNamespace()
+        )
+        assert profiler.enabled == (enabled and role == "runner")
+
+
 class Event:
     def __init__(self, elapsed=0.0):
         self.elapsed = elapsed

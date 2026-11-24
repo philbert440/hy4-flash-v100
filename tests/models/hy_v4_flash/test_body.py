@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -97,6 +98,9 @@ def _install_module(monkeypatch, name, **symbols):
 
 def _checkpoint_name(name):
     for old, new in (
+        (".post_mlp_layernorm.", ".mlp.post_fc2_norm."),
+        (".pre_expert_proj.", ".routed_expert_down_proj."),
+        (".post_expert_proj.", ".routed_expert_up_proj."),
         ("attn_hc.fn", "hc_attn_layer.hc_pre.hc_fn"),
         ("attn_hc.base", "hc_attn_layer.hc_pre.hc_base"),
         ("attn_hc.scale", "hc_attn_layer.hc_pre.hc_scale"),
@@ -260,12 +264,12 @@ def test_latent_moe_and_router(
     ref.gate.e_score_correction_bias.copy_(candidate.expert_bias)
     ref.experts.gate_up_proj.copy_(candidate.experts.w13_weight)
     ref.experts.down_proj.copy_(candidate.experts.w2_weight)
-    for projection in (
-        "routed_expert_down_proj",
-        "routed_expert_up_proj",
-        "combine_output_norm",
+    for oracle_name, candidate_name in (
+        ("pre_expert_proj", "routed_expert_down_proj"),
+        ("post_expert_proj", "routed_expert_up_proj"),
+        ("combine_output_norm", "combine_output_norm"),
     ):
-        getattr(ref, projection).weight.copy_(getattr(candidate, projection).weight)
+        getattr(ref, oracle_name).weight.copy_(getattr(candidate, candidate_name).weight)
     gate, up = candidate.shared_experts.gate_up_proj.weight.chunk(2)
     ref.shared_experts.gate_proj.weight.copy_(gate)
     ref.shared_experts.up_proj.weight.copy_(up)
@@ -293,3 +297,228 @@ def test_latent_moe_and_router(
         torch.testing.assert_close(got, expected, atol=3e-3, rtol=3e-3)
     _record_error(record_property, "routed_weights", w, ref_w)
     _record_error(record_property, "latent_moe", got, expected)
+
+
+@torch.inference_mode()
+def test_verify_body_row_shapes(cpu_vllm, torch_experts, monkeypatch, record_property):
+    import os
+    from collections import defaultdict
+    from contextlib import nullcontext
+
+    from vllm.forward_context import get_forward_context
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.models.hy_v4_flash.sm70.attention import HYV4FlashAttention
+    from vllm.models.hy_v4_flash.sm70.cache import (
+        FlashCache,
+        FlashMetadata,
+        IndexPoolDecodeWorkspace,
+        QuerySpan,
+    )
+    from vllm.models.hy_v4_flash.sm70.verification import (
+        VerificationGraph,
+        VerificationState,
+    )
+    from vllm.triton_utils import HAS_TRITON
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    if not HAS_TRITON or os.environ.get("TRITON_INTERPRET") != "1":
+        pytest.skip("Triton CPU interpreter required")
+    torch.manual_seed(823)
+    cfg = HYV4FlashConfig(
+        **_config(
+            compressed_indexer_compress_ratio=4,
+            compressed_indexer_group_topk=4,
+            sliding_window=8,
+            enable_ihc=True,
+            sandwich_norm=True,
+            swiglu_limit=10.0,
+        )
+    )
+    cpu_vllm.model_config = SimpleNamespace(
+        hf_text_config=cfg, dtype=torch.float16, max_model_len=256
+    )
+    with set_default_torch_dtype(torch.float16):
+        model = HYV4FlashForCausalLM(vllm_config=cpu_vllm)
+    for p in model.parameters():
+        p.uniform_(-0.8, 0.8)
+        if p.ndim > 1:
+            p.div_(p.shape[-1] ** 0.5)
+    owners = {
+        name: owner
+        for name, owner in model.named_modules()
+        if isinstance(owner, FlashCache)
+    }
+    for owner in owners.values():
+        spec = owner.spec
+        owner.bind_kv_cache(torch.zeros(
+            2, spec.storage_block_size, spec.head_size, dtype=spec.dtype
+        ))
+
+    captured = defaultdict(list)
+
+    def capture(name, out):
+        tensors = out if isinstance(out, tuple) else (out,)
+        for i, tensor in enumerate(tensors):
+            if isinstance(tensor, torch.Tensor):
+                captured[f"{name}[{i}]"].append(tensor.clone())
+
+    row_modules = (
+        "norm", "hc_pre", "hc_post", "hc_head",
+        "experts", ".mlp", "self_attn", "embed_tokens",
+    )
+    for name, module in model.named_modules():
+        # Attention projection weights used in absorbed BMMs have no forward.
+        if name.endswith("indexer.key_norm"):
+            continue  # Group-close rows are already checked in the cache test.
+        if isinstance(module, LinearBase) or name.endswith(row_modules):
+            module.register_forward_hook(
+                lambda _m, _i, out, name=name: capture(name, out)
+            )
+
+    original_body = HYV4FlashAttention._project
+    original_output = HYV4FlashAttention._project_output
+
+    def project(self, positions, hidden_states):
+        out = original_body(self, positions, hidden_states)
+        capture(self.prefix + ".projected_q_kv_qc_cos_sin", out[:6])
+        return out
+
+    def project_output(self, latent, w_uv, hidden_states, gate_sig=None):
+        capture(self.prefix + ".attention_latent", latent)
+        return original_output(self, latent, w_uv, hidden_states, gate_sig)
+
+    def aggregate(
+        self, q, kv, rope, x, q_c, positions, cos, sin, metadata, *,
+        prep_writes_cache=False, prep_writes_indices=False, w_uv=None, gate_sig=None,
+    ):
+        assert not prep_writes_cache and not prep_writes_indices
+        assert w_uv is None and gate_sig is None
+        main = metadata[self.attn.prefix]
+        cache = self.attn.kv_cache
+        page = cache.shape[1]
+        slots = main.slot_mapping
+        indices = self.topk_indices_buffer[:len(q), :self.width]
+        args = x, q_c, positions, cos, sin, metadata, indices, page
+        graph = get_forward_context().additional_kwargs.get("hy4_verify_graph")
+        if graph is not None:
+            counts = self._verification_slots(*args, graph)
+        elif main.decode:
+            counts = self._decode_slots(*args)
+        else:
+            counts = self._eager_slots(*args, decode_verification=True)
+        cache[slots // page, slots % page] = torch.cat((kv, rope), dim=-1)
+        latent = self._read_cache(
+            q, cache, indices, counts, self.learnable_sink_param, None, main,
+            verification_width=graph.width if graph is not None else 0,
+        )
+        return latent, False
+
+    monkeypatch.setattr(HYV4FlashAttention, "_project", project)
+    monkeypatch.setattr(HYV4FlashAttention, "_project_output", project_output)
+    monkeypatch.setattr(HYV4FlashAttention, "_aggregate", aggregate)
+    ids = torch.randint(3, cfg.vocab_size, (24,))
+    prefix = len(ids) - 6
+    pos = torch.arange(len(ids))
+
+    def step(start, end, decode=False, verify=False, graph=None):
+        width = end - start
+        starts, lengths = torch.tensor([0, width]).int(), torch.tensor([end]).int()
+        span = QuerySpan(0, width, start, end)
+        metadata = {}
+        for name, owner in owners.items():
+            page = owner.kv_cache.shape[1]
+            ring = isinstance(owner.spec, CircularBufferSpec)
+            index = getattr(owner.spec, "compress_ratio", 1) > 1
+            scratch = None
+            if decode and index:
+                ratio, dim = cfg.compressed_indexer_compress_ratio, owner.spec.head_size
+                groups = cpu_vllm.model_config.max_model_len // ratio
+                topk = cfg.compressed_indexer_group_topk - 1
+                scratch = IndexPoolDecodeWorkspace(
+                    torch.empty(1, ratio, dim),
+                    torch.empty(1, dtype=torch.int64),
+                    torch.empty(1, groups),
+                    torch.empty(1, topk),
+                    *(torch.empty(1, topk, dtype=torch.int64) for _ in range(3)),
+                )
+            metadata[name] = FlashMetadata(
+                (span,), torch.tensor([[1]], dtype=torch.int32),
+                pos[start:end] + page if not ring and not index else torch.empty(0),
+                width, starts, lengths, decode, torch.empty(width, dtype=torch.int32),
+                scratch,
+            )
+        state = VerificationState()
+        scope = (
+            state.forward(
+                metadata, owners, [("row", span)], {"row"}, {"row": start + 1}, graph,
+            )
+            if verify else nullcontext()
+        )
+        with scope, set_forward_context(metadata, cpu_vllm):
+            if graph is not None:
+                get_forward_context().additional_kwargs["hy4_verify_graph"] = graph
+            hidden = model(ids[start:end], pos[start:end])
+            capture("final_hidden", hidden)
+            capture("logits", model.compute_logits(hidden))
+
+    init_workspace_manager(torch.device("cpu"))
+    try:
+        step(0, prefix)
+        seed = {name: owner.kv_cache.clone() for name, owner in owners.items()}
+        captured.clear()
+        step(prefix, len(ids), verify=True)
+        verified = {key: torch.cat(rows) for key, rows in captured.items()}
+        tail_names = tuple(
+            name for name, owner in owners.items()
+            if isinstance(owner.spec, CircularBufferSpec)
+        )
+        graph = VerificationGraph(
+            tail_names,
+            torch.empty(len(tail_names), 6, owners[tail_names[0]].spec.head_size),
+            {},
+            6,
+        )
+        original_ids = ids.clone()
+        for replay in range(2):
+            reference = verified
+            if replay:
+                ids[prefix:] = (ids[prefix:] + 1) % cfg.vocab_size
+                for name, owner in owners.items():
+                    owner.kv_cache.copy_(seed[name])
+                captured.clear()
+                step(prefix, len(ids), verify=True)
+                reference = {key: torch.cat(rows) for key, rows in captured.items()}
+            for name, owner in owners.items():
+                owner.kv_cache.copy_(seed[name])
+            captured.clear()
+            step(prefix, len(ids), verify=True, graph=graph)
+            for key in ("final_hidden[0]", "logits[0]"):
+                expected = reference[key].contiguous().view(torch.uint8)
+                actual = torch.cat(captured[key]).contiguous().view(torch.uint8)
+                assert torch.equal(actual, expected), (replay, key)
+            print(f"Graph-shaped replay {replay}: six hidden and logit rows bit-identical")
+        ids.copy_(original_ids)
+        captured.clear()
+        for name, owner in owners.items():
+            owner.kv_cache.copy_(seed[name])
+        for row in range(prefix, len(ids)):
+            step(row, row + 1, decode=True)
+
+        assert captured.keys() == verified.keys()
+        for name, outputs in captured.items():
+            expected, actual = torch.cat(outputs), verified[name]
+            assert actual.shape == expected.shape and len(actual) == 6, name
+            delta = (actual.float() - expected.float()).abs().flatten(1).amax(dim=1)
+            equal = (actual == expected).flatten(1).all(dim=1)
+            print(f"{name} equal={equal.tolist()} max_abs={delta.tolist()}")
+            record_property(name + ".max_abs", delta.max().item())
+            assert torch.isfinite(delta).all()
+        logits = torch.cat(captured["logits[0]"])
+        assert torch.isfinite(verified["logits[0]"]).all()
+        print(
+            "greedy ids", logits.argmax(-1).tolist(),
+            verified["logits[0]"].argmax(-1).tolist(),
+        )
+    finally:
+        reset_workspace_manager()

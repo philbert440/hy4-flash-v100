@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 """Split-K decode for Hy4 Flash's paged MLA cache."""
 
@@ -15,9 +16,9 @@ _KEYS_PER_SPLIT = 32
 
 
 def decode_workspace_specs(
-    rows: int, heads: int, width: int, latent: int
+    rows: int, heads: int, width: int, latent: int, *, minimum_splits: int = 0
 ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
-    splits = cdiv(width, _KEYS_PER_SPLIT)
+    splits = max(cdiv(width, _KEYS_PER_SPLIT), minimum_splits)
     return (
         ((rows, heads, splits, 2), torch.float32),
         ((rows, heads, splits, latent), torch.float32),
@@ -28,6 +29,7 @@ def decode_workspace_specs(
 def _decode_split(
     Q,
     KV,
+    DraftKV,
     Indices,
     Counts,
     State,
@@ -46,6 +48,8 @@ def _decode_split(
     SPLIT_SIZE: tl.constexpr,
     H: tl.constexpr,
     N: tl.constexpr,
+    QUERY_WIDTH: tl.constexpr,
+    DRAFT_STRIDE: tl.constexpr,
 ):
     # Adapted from DeepSeek V4 SM70 _sm70_sparse_paged_fp8_splitk_kernel.
     row = tl.program_id(0)
@@ -67,9 +71,21 @@ def _decode_split(
         for tile in range(start, end, N):
             n = tile + tl.arange(0, N)
             live = n < end
-            slot = tl.load(Indices + row * stride_indices + n, live, other=0)
+            if QUERY_WIDTH:
+                request = row // QUERY_WIDTH
+                history = length - row % QUERY_WIDTH - 1
+                in_history = n < history
+                slot = tl.load(
+                    Indices + request * stride_indices + n, live & in_history, other=0
+                )
+            else:
+                slot = tl.load(Indices + row * stride_indices + n, live, other=0)
             page = (slot // PAGE).to(tl.int64)
             kb = KV + page * stride_kvp + (slot % PAGE) * stride_kvr
+            if QUERY_WIDTH:
+                # Only the causal prefix of this request's draft block is live.
+                draft_row = request * QUERY_WIDTH + n - history
+                kb = tl.where(in_history, kb, DraftKV + draft_row * DRAFT_STRIDE)
             k, kr = load_main_kv(kb, d, r, live, LATENT)
             logits = (tl.dot(q, tl.trans(k)) + tl.dot(qr, tl.trans(kr))) * SCALE
             logits = tl.where(live[None, :], logits, float("-inf"))
@@ -144,6 +160,8 @@ def paged_attention_splitk(
     partial_state: torch.Tensor,
     partial_acc: torch.Tensor,
     lse: torch.Tensor | None = None,
+    *,
+    draft_kv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rows, heads, dim = q.shape
     splits, latent = partial_acc.shape[-2:]
@@ -153,6 +171,7 @@ def paged_attention_splitk(
     _decode_split[(rows, triton.cdiv(heads, 8), splits)](
         q,
         cache,
+        draft_kv,
         slots,
         counts,
         partial_state,
@@ -171,6 +190,8 @@ def paged_attention_splitk(
         _KEYS_PER_SPLIT,
         8,
         16,
+        0 if draft_kv is None else draft_kv.shape[1],
+        0 if draft_kv is None else draft_kv.stride(1),
         num_warps=4,
     )
     reduce_dim = min(latent, 64)

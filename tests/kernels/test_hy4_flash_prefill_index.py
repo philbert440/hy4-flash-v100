@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 import os
 
@@ -10,6 +11,7 @@ from vllm.models.hy_v4_flash.sm70 import kernels
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.math_utils import cdiv
+from vllm.v1.worker import workspace
 
 
 @pytest.fixture
@@ -38,6 +40,9 @@ def should_do_global_cleanup_after_test() -> bool:
 )
 @pytest.mark.parametrize("world", [1, 4])
 def test_prefill_scores_match_paged(monkeypatch, device, world):
+    monkeypatch.setattr(
+        workspace, "_manager", workspace.WorkspaceManager(torch.device(device))
+    )
     rng = torch.Generator().manual_seed(41)
     rows, heads, dim = 7, 16, 128
     first, ratio, page, pages_per_block = 2303, 4, 64, 2
@@ -52,12 +57,19 @@ def test_prefill_scores_match_paged(monkeypatch, device, world):
     old, new = torch.empty_like(reference), torch.empty_like(reference)
     # Exercise both levels of key tiling on a small fixture.
     monkeypatch.setattr(kernels, "_INDEX_PREFILL_GROUP_TILE", 128)
-    monkeypatch.setattr(kernels, "_INDEX_PREFILL_GEMM_BUDGET", rows * heads * 64)
+    # The production budget is in whole MiB. Cap the sizing helper's
+    # result at the donor fixture's sub-MiB element budget.
+    gemm_elements = kernels.index_prefill_gemm_elements
+
+    def small_gemm_budget(query_rows, key_rows, tile_mb):
+        return min(gemm_elements(query_rows, key_rows, tile_mb), rows * heads * 64)
+
+    monkeypatch.setattr(kernels, "index_prefill_gemm_elements", small_gemm_budget)
     if device == "cpu":
         mm = torch.mm
 
-        def cpu_mm(q, k, *, out_dtype):
-            return mm(q.to(out_dtype), k.to(out_dtype))
+        def cpu_mm(q, k, *, out_dtype, out):
+            return mm(q.to(out_dtype), k.to(out_dtype), out=out)
 
         # CPU mm has no out_dtype argument. Run the same FP32 dot products.
         monkeypatch.setattr(kernels.torch, "mm", cpu_mm)
@@ -87,7 +99,9 @@ def test_prefill_scores_match_paged(monkeypatch, device, world):
             pages_per_block,
         )
         baseline = kernels.index_scores(*args, world=world, rank=rank).cpu()
-        actual = kernels.index_prefill_scores(*args, world=world, rank=rank).cpu()
+        actual = kernels.index_prefill_scores(
+            *args, world=world, rank=rank, tile_mb=1
+        ).cpu()
         assert torch.equal(actual.isneginf(), masked)
         assert torch.equal(baseline.isneginf(), masked)
         cols = reference[:, rank::world].shape[1]

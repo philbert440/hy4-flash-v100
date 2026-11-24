@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """Helpers for the Hy4-flash parser tests.
 
 They use the checkpoint's real tokenizer and ``chat_template.jinja``. Point
@@ -266,13 +267,12 @@ def parse_streaming(
     assert "".join(t for t, _ in deltas) == output
 
     out = Parsed()
-    for i, (text, ids) in enumerate(deltas):
+    for text, ids in deltas:
         msg = parser.parse_delta(
             delta_text=text,
             delta_token_ids=ids,
             request=request,
             prompt_token_ids=prompt_ids,
-            finished=i == len(deltas) - 1,
         )
         if msg is None:
             continue
@@ -308,9 +308,7 @@ def parse_nonstreaming(
     reasoning_parser = parser.reasoning_parser
     tool_parser = parser.tool_parser
     assert reasoning_parser is not None and tool_parser is not None
-    reasoning, content = reasoning_parser.extract_reasoning_with_token_ids(
-        output, encode(tokenizer, output), request
-    )
+    reasoning, content = reasoning_parser.extract_reasoning(output, request)
     out = Parsed(reasoning=reasoning, content=content)
     info = tool_parser.extract_tool_calls(content or "", request)
     if info.tools_called:

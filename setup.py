@@ -1344,6 +1344,10 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
+        ext_modules.append(CMakeExtension(name="vllm._sm70_hy4_moe_C"))
+        ext_modules.append(CMakeExtension(name="vllm._sm70_hy4_attn_C"))
+        ext_modules.append(CMakeExtension(name="vllm._sm70_hy4_next_C"))
+        ext_modules.append(CMakeExtension(name="vllm._sm70_idx_tc_C"))
         # These extensions use pybind11/libtorch_python and therefore require
         # the interpreter-specific CPython ABI suffix emitted by CMake.
         ext_modules.append(

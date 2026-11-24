@@ -294,6 +294,10 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # HY4_DCONF2_LATE_WIDTH: scheduled drafts the worker cut before verifying.
+    # The scheduler still counts them as rejected; spec-decode stats skip them.
+    hy4_unused_drafts: dict[str, int] | None = None
+
     # Synchronous PP drafts belong to this output, never a worker's latest slot.
     # None is used for empty, non-speculative and asynchronous outputs.
     draft_token_ids: "DraftTokenIds | None" = None

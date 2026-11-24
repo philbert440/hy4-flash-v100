@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -8,7 +9,16 @@ import numpy as np
 import pytest
 import torch
 
+from tests.kernels.test_hy4_flash_verification import (
+    forward_scope,
+    keys,
+    new_indexer,
+    prepare,
+)
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.models.hy_v4_flash.sm70.cache import QuerySpan
+from vllm.models.hy_v4_flash.sm70.indexpool import FlashCompressedIndexer
+from vllm.models.hy_v4_flash.sm70.verification import VerificationState
 from vllm.platforms import current_platform
 from vllm.platforms.interface import PlatformEnum
 from vllm.sampling_params import SamplingParams
@@ -28,6 +38,7 @@ pytestmark = pytest.mark.skip_global_cleanup
 def make_runner(monkeypatch):
     runner = object.__new__(GPUModelRunner)
     runner.device = torch.device("cpu")
+    runner.model = torch.nn.Module()
     runner.input_batch = InputBatch(
         max_num_reqs=4,
         max_model_len=96,
@@ -44,6 +55,7 @@ def make_runner(monkeypatch):
     runner._dynamic_draft_vocab_prefill_bootstrap = Mock()
     runner.late_interaction_runner = Mock()
     runner._may_reorder_batch = lambda output: None
+    runner.pp_keep_batch = False
     runner.speculative_config = None
     runner.is_pooling_model = False
     runner.uses_mrope = False
@@ -111,7 +123,7 @@ def test_history_through_real_scheduler_and_runner(monkeypatch, budget):
         assert output.num_scheduled_tokens
         runner._update_states(output)
         kwargs: dict[str, torch.Tensor] = {}
-        runner._maybe_add_flash_engram_kwargs(
+        runner._maybe_add_ngram_kwargs(
             kwargs,
             num_reqs=runner.input_batch.num_reqs,
             num_reqs_padded=runner.input_batch.num_reqs,
@@ -183,3 +195,161 @@ def test_history_through_real_scheduler_and_runner(monkeypatch, budget):
         for req, cursor, _ in history
     )
     assert any(req == "other" for req, _, _ in history)
+
+
+@pytest.mark.parametrize("accepted", [*range(6), "streaming_stop"])
+def test_history_after_target_rejection(monkeypatch, accepted):
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    monkeypatch.setattr(current_platform, "_enum", PlatformEnum.CPU)
+    create_requests(0)
+    # Use the generic scheduler with stub drafts to exercise cursor correction.
+    # Hy4's launch configuration still rejects speculative decoding.
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=9,
+        max_model_len=96,
+        num_speculative_tokens=5,
+        block_size=16,
+        async_scheduling=False,
+    )
+    runner = make_runner(monkeypatch)
+    prompt = list(range(10, 17))
+    streaming = accepted == "streaming_stop"
+    accepted = 5 if streaming else accepted
+    req_id = "verify"
+    stop_token_ids = [351] if streaming else None
+    params = SamplingParams(temperature=0, max_tokens=16, stop_token_ids=stop_token_ids)
+    request = Request(
+        req_id,
+        prompt.copy(),
+        params,
+        None,
+        resumable=streaming,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    scheduler.add_request(request)
+    actual, reference = new_indexer(), new_indexer()
+    table = torch.tensor([1])
+    prefix = len(prompt)
+    for indexer in (actual, reference):
+        prepare(indexer, table, 0, prefix)
+    state = runner._hy4_verification = actual.verification = VerificationState()
+    ring = actual.tail_cache
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context={ring.prefix: ring}
+    )
+
+    def scheduled_forward(output, ids=()):
+        width = output.num_scheduled_tokens[req_id]
+        start = runner.requests[req_id].num_computed_tokens
+        span = QuerySpan(0, width, start, start + width)
+        _, metadata = forward_scope(actual, [(req_id, span)], table[None], ids)
+        inputs, phase = keys(start, start + width, 1, table.device)
+        with runner._hy4_verification_forward(
+            {ring.prefix: metadata}, [req_id], [width], ids
+        ):
+            FlashCompressedIndexer.prepare_groups(
+                actual,
+                inputs,
+                phase,
+                torch.ones(32),
+                span,
+                table,
+                table,
+                metadata.verification,
+            )
+        return start, width
+
+    def sample(output, tokens):
+        req_id = request.request_id
+        index = runner.input_batch.req_id_to_index[req_id]
+        start = runner.input_batch.num_tokens_no_spec[index]
+        stop = start + len(tokens)
+        runner.input_batch.token_ids_cpu[index, start:stop] = tokens
+        runner.input_batch.is_token_ids[index, start:stop] = True
+        runner.input_batch.num_tokens_no_spec[index] = stop
+        runner.requests[req_id].output_token_ids.extend(tokens)
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[req_id],
+                req_id_to_index={req_id: index},
+                sampled_token_ids=[tokens],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    prefill = scheduler.schedule()
+    runner._update_states(prefill)
+    sample(prefill, [200])
+    drafts = [350, 351, 352, 353, 354]
+    request.spec_token_ids = drafts
+    verify = scheduler.schedule()
+    assert verify.scheduled_spec_decode_tokens == {request.request_id: drafts}
+    runner._update_states(verify)
+    assert runner._prepare_ngram_context(1, 1)[0].tolist() == prompt[-2:]
+    scheduled_forward(verify, (req_id,))
+    if streaming:
+        scheduler.add_request(
+            Request(
+                req_id,
+                [701],
+                params,
+                None,
+                resumable=True,
+                block_hasher=get_request_block_hasher(16, sha256),
+            )
+        )
+    sample(verify, drafts[:accepted] + [900])
+    committed = prompt + [200] + drafts[: (2 if streaming else accepted)]
+    assert request.num_computed_tokens == len(committed)
+
+    replay = scheduler.schedule()
+    runner._update_states(replay)
+    # The replacement token and any remaining proposal bytes are outside
+    # the history. The replacement will enter history after this forward.
+    assert runner.input_batch.num_computed_tokens_cpu[0] == len(committed)
+    assert runner._prepare_ngram_context(1, 1)[0].tolist() == committed[-2:]
+    assert state.has_pending(req_id)
+
+    # A consistent-looking runner/batch cursor at the optimistic end is
+    # still invalid when the canonical token history ends before that read.
+    if not streaming and accepted < len(drafts):
+        optimistic = prefix + 1 + len(drafts)
+        runner.requests[req_id].num_computed_tokens = optimistic
+        runner.input_batch.num_computed_tokens_cpu[0] = optimistic
+        try:
+            with pytest.raises(RuntimeError, match="exceeds finalized history"):
+                scheduled_forward(replay)
+        finally:
+            runner.requests[req_id].num_computed_tokens = len(committed)
+            runner.input_batch.num_computed_tokens_cpu[0] = len(committed)
+
+    start, width = scheduled_forward(replay)
+    for pos in range(prefix, start + width):
+        prepare(reference, table, pos, pos + 1)
+    for pos in range(start + width, start + width + 5):
+        span = QuerySpan(0, 1, pos, pos + 1)
+        inputs, phase = keys(pos, pos + 1, 31, table.device)
+        with state.forward(None, {}, [(req_id, span)], (), {}):
+            FlashCompressedIndexer.prepare_groups(
+                actual,
+                inputs,
+                phase,
+                torch.ones(32),
+                span,
+                table,
+                table,
+            )
+        prepare(reference, table, pos, pos + 1, offset=31)
+        closed = (pos + 1) // 4
+        assert torch.equal(
+            actual.k_cache.kv_cache[1, :closed], reference.k_cache.kv_cache[1, :closed]
+        )
+        live = (pos + 1) % 4
+        assert torch.equal(
+            actual.tail_cache.kv_cache[1, :live],
+            reference.tail_cache.kv_cache[1, :live],
+        )

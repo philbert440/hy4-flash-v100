@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 import contextlib
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -345,8 +346,76 @@ class HYV4FlashForCausalLMConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CompilationMode, CUDAGraphMode
         from vllm.config.vllm import OptimizationLevel
+        from vllm.models.hy_v4_flash.profile import initialize_profile
 
         parallel = vllm_config.parallel_config
+        from vllm.platforms import current_platform
+
+        spec = vllm_config.speculative_config
+        if spec is not None and getattr(spec, "method", None) != "dfly":
+            raise NotImplementedError(
+                "Hy4 Flash does not support --speculative-config with this method. "
+                "Use method='dfly'."
+            )
+        if (
+            current_platform.is_cuda()
+            and vllm_config.device_config.device_type == "cuda"
+        ):
+            if parallel.tensor_parallel_size != 4:
+                raise NotImplementedError(
+                    "Hy4 Flash requires --tensor-parallel-size 4."
+                )
+            if vllm_config.cache_config.cache_dtype not in (
+                "auto", "float16", "fp8_ds_mla"
+            ):
+                raise NotImplementedError(
+                    "Hy4 Flash --kv-cache-dtype requires auto, float16, "
+                    "or fp8_ds_mla."
+                )
+        if spec is not None:
+            import torch
+
+            from vllm import envs
+            from vllm.models.hy_v4_flash.dfly_config import (
+                QUERY_WIDTH,
+                DFlySettings,
+                validate_parallel_config,
+            )
+
+            validate_parallel_config(parallel)
+            if envs.HY4_F7_HC_BRIDGE:
+                raise ValueError(
+                    "Hy4 DFly2 does not support HY4_F7_HC_BRIDGE=1. "
+                    "Set HY4_F7_HC_BRIDGE=0 to use DFly2."
+                )
+            if vllm_config.use_v2_model_runner:
+                raise ValueError("Hy4 DFly2 requires VLLM_USE_V2_MODEL_RUNNER=0.")
+            if vllm_config.scheduler_config.async_scheduling:
+                raise ValueError("Hy4 DFly2 requires --no-async-scheduling.")
+            if parallel.use_ubatching or parallel.enable_eplb:
+                raise ValueError(
+                    "Hy4 DFly2 does not support microbatching or --enable-eplb."
+                )
+            if (
+                vllm_config.lora_config is not None
+                or vllm_config.kv_transfer_config is not None
+            ):
+                raise ValueError(
+                    "Hy4 DFly2 does not support --enable-lora or --kv-transfer-config."
+                )
+            model = vllm_config.model_config
+            if model.dtype != torch.float16:
+                raise ValueError("Hy4 DFly2 requires --dtype half.")
+            if vllm_config.load_config.load_format not in (
+                "auto",
+                "safetensors",
+                "fastsafetensors",
+                "instanttensor",
+            ):
+                raise ValueError(
+                    "Hy4 DFly2 requires an indexed safetensors --load-format."
+                )
+            DFlySettings.from_checkpoint(model.hf_config, model.hf_text_config)
         dcp = parallel.decode_context_parallel_size
         if dcp > 1:
             if (
@@ -367,6 +436,39 @@ class HYV4FlashForCausalLMConfig(VerifyAndUpdateConfig):
                 raise NotImplementedError("Hy4 Flash DCP requires A2A communication.")
 
         compilation = vllm_config.compilation_config
+        if spec is not None:
+            capture = (
+                envs.VLLM_HY4_DFLY_GRAPHS != "off"
+                and not (model.enforce_eager or spec.enforce_eager)
+                and compilation.cudagraph_mode != CUDAGraphMode.NONE
+            )
+            compilation.cudagraph_mode = (
+                CUDAGraphMode.FULL_DECODE_ONLY if capture else CUDAGraphMode.NONE
+            )
+            if capture:
+                if (
+                    parallel.data_parallel_size != 1
+                    or compilation.mode not in (None, CompilationMode.NONE)
+                    or compilation.pass_config.enable_sp
+                ):
+                    raise ValueError("Hy4 DFly2 graphs require DP1 and no compilation.")
+                if compilation.cudagraph_capture_sizes is None:
+                    scheduler = vllm_config.scheduler_config
+                    limit = min(
+                        scheduler.max_num_seqs * QUERY_WIDTH,
+                        scheduler.max_num_batched_tokens,
+                        compilation.max_cudagraph_capture_size or 24,
+                    )
+                    compilation.cudagraph_capture_sizes = [
+                        n * QUERY_WIDTH for n in (1, 2, 3, 4) if n * QUERY_WIDTH <= limit
+                    ]
+                    if not compilation.cudagraph_capture_sizes:
+                        raise ValueError(
+                            "Hy4 DFly2 graphs need at least six token rows."
+                        )
+                    compilation.max_cudagraph_capture_size = (
+                        compilation.cudagraph_capture_sizes[-1]
+                    )
         if compilation.mode is None:
             compilation.mode = CompilationMode.NONE
         if (
@@ -374,6 +476,49 @@ class HYV4FlashForCausalLMConfig(VerifyAndUpdateConfig):
             and vllm_config.optimization_level != OptimizationLevel.O0
         ):
             compilation.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
+        initialize_profile(vllm_config)
+
+
+class HYV4FlashVLForConditionalGenerationConfig(HYV4FlashForCausalLMConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        HYV4FlashForCausalLMConfig.verify_and_update_config(vllm_config)
+
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        # The indexer tail stores one coordinate or three for the whole
+        # process. A vision server widens every request; a text server does not.
+        multimodal = model_config.multimodal_config
+        if multimodal is None or multimodal.get_limit_per_prompt("image") <= 0:
+            return
+        configs = []
+        for config in (model_config.hf_text_config, model_config.hf_config):
+            if config is not None and all(config is not seen for seen in configs):
+                configs.append(config)
+        found = False
+        for config in configs:
+            rope = getattr(config, "rope_parameters", None)
+            if not isinstance(rope, dict) or "mrope_section" in rope:
+                found = found or isinstance(rope, dict) and "mrope_section" in rope
+                continue
+            section = None
+            interleaved = None
+            for value in rope.values():
+                if isinstance(value, dict) and value.get("mrope_section") is not None:
+                    section = list(value["mrope_section"])
+                    interleaved = value.get("mrope_interleaved")
+                    break
+            if section is None:
+                raise ValueError(
+                    "Hy4 vision server needs mrope_section in rope_parameters"
+                )
+            rope["mrope_section"] = section
+            if interleaved is not None:
+                rope["mrope_interleaved"] = interleaved
+            found = True
+        if not found:
+            raise ValueError("Hy4 vision server needs mrope_section in rope_parameters")
 
 
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
@@ -934,6 +1079,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
     "GteNewModel": GteNewModelConfig,
+    "HYV4FlashVLForConditionalGeneration": HYV4FlashVLForConditionalGenerationConfig,
     "HYV4FlashForCausalLM": HYV4FlashForCausalLMConfig,
     "JambaForSequenceClassification": JambaForSequenceClassificationConfig,
     "JinaForRanking": JinaForRankingConfig,

@@ -18,7 +18,7 @@ build-backend = "setuptools.build_meta"
 name = "1cat-vllm"
 authors = [{name = "1Cat AI"}, {name = "vLLM Team"}]
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "csrc/sm70_turbomind/ops/LICENSE.v100-skinny"]
 readme = "README.md"
 description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
 classifiers = [

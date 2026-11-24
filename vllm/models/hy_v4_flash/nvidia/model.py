@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted for 1Cat from Leonccaa/ReVolta v0.2.0rc13 (8b49690a3).
 """HYV4 Flash text backbone (vllm-project/vllm#68296)."""
 
 import json
@@ -24,8 +25,16 @@ from vllm.models.hy_v4.nvidia.model import (
     HYV4Model,
 )
 from vllm.models.hy_v4_flash.configs import HYV4FlashConfig
+from vllm.models.hy_v4_flash.profile import speed_setting
+from vllm.models.hy_v4_flash.sm70.dense import (
+    FP16StorageHead,
+    W8StorageHead,
+    fp16_storage_enabled,
+    w8_head_enabled,
+)
 from vllm.sequence import IntermediateTensors
 
+from .hc_bridge import bridge, can_bridge, finish_post, initialize_bridge
 from .moe import HYV4FlashFeedForward, HYV4FlashMoE
 
 _EXPERT = re.compile(r"(layers\.\d+\.mlp\.)(experts\.\d+\.[^.]+\.)([^.]+)")
@@ -51,6 +60,10 @@ class HYV4FlashDecoderLayer(HYV4DecoderLayer):
         super().__init__()
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
         self.enable_ihc = config.enable_ihc
+        self._bridge_rms = speed_setting("HY4_NODES_BRIDGE_RMS", vllm_config)
+        self._bridge_split_big_mix = speed_setting(
+            "HY4_BRIDGE_SPLIT_BIG_MIX", vllm_config
+        )
         self.self_attn = HYV4FlashAttention(
             vllm_config,
             config,
@@ -71,6 +84,36 @@ class HYV4FlashDecoderLayer(HYV4DecoderLayer):
             config, self.layer_idx, prefix=f"{prefix}.hc_mlp_layer"
         )
 
+    def forward_f7_ihc(
+        self,
+        positions: torch.Tensor,
+        streams: torch.Tensor,
+        previous: torch.Tensor | None,
+        previous_post: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        split_big_mix = getattr(self, "_bridge_split_big_mix", False)
+        if getattr(self, "_bridge_rms", False):
+            hidden, post, streams = bridge(
+                self.hc_attn_layer, streams, previous, previous_post,
+                norm=self.input_layernorm, split_big_mix=split_big_mix,
+            )
+            attention = self.self_attn(positions, hidden)
+            hidden, post, streams = bridge(
+                self.hc_mlp_layer, streams, attention, post,
+                norm=self.post_attention_layernorm, split_big_mix=split_big_mix,
+            )
+            return streams, self.mlp(hidden), post
+        hidden, post, streams = bridge(
+            self.hc_attn_layer, streams, previous, previous_post,
+            split_big_mix=split_big_mix,
+        )
+        attention = self.self_attn(positions, self.input_layernorm(hidden))
+        hidden, post, streams = bridge(
+            self.hc_mlp_layer, streams, attention, post,
+            split_big_mix=split_big_mix,
+        )
+        return streams, self.mlp(self.post_attention_layernorm(hidden)), post
+
 
 class HYV4FlashModel(HYV4Model):
     decoder_layer_cls = HYV4FlashDecoderLayer
@@ -78,6 +121,9 @@ class HYV4FlashModel(HYV4Model):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._init_expert_mapping()
+        self._f7_hc_bridge = speed_setting("HY4_F7_HC_BRIDGE", vllm_config)
+        if self.enable_ihc:
+            initialize_bridge(self._f7_hc_bridge)
         self.engram_hash = None
         self.engram_indices = {
             layer_id - 1: index
@@ -113,6 +159,7 @@ class HYV4FlashModel(HYV4Model):
             if inputs_embeds is not None
             else self.embed_input_ids(input_ids)
         )
+        hashes = None
         if self.engram_hash is not None:
             hashes = input_ids.new_empty(
                 (
@@ -128,10 +175,14 @@ class HYV4FlashModel(HYV4Model):
                 self.layers[0].self_attn.attn.prefix,
                 hashes,
             )
+        if self.enable_ihc and can_bridge(hidden, self.config, self._f7_hc_bridge):
+            hidden = self._forward_f7_ihc_layers(positions, hidden, hashes)
+            return self.norm(self.hc_head(hidden))
         residual = None
         for index, layer in enumerate(self.layers):
             if index in self.engram_indices:
                 hidden = layer.hc_attn_layer.prepare_input(hidden)
+                assert hashes is not None
                 hidden = layer.engram_layer(hidden, hashes[self.engram_indices[index]])
             hidden, residual = layer(positions, hidden, residual)
         if self.enable_ihc:
@@ -139,6 +190,31 @@ class HYV4FlashModel(HYV4Model):
         elif residual is not None:
             hidden = hidden + residual
         return self.norm(hidden)
+
+    def _forward_f7_ihc_layers(
+        self,
+        positions: torch.Tensor,
+        hidden: torch.Tensor,
+        hashes: torch.Tensor | None,
+    ) -> torch.Tensor:
+        previous = previous_post = None
+        hidden = self.layers[0].hc_attn_layer.prepare_input(hidden)
+        for index, layer in enumerate(self.layers):
+            if index in self.engram_indices:
+                # Engram consumes the materialized old residual before
+                # the next attention gates can be computed.
+                hidden = finish_post(
+                    layer.hc_attn_layer, hidden, previous, previous_post
+                )
+                assert hashes is not None
+                hidden = layer.engram_layer(hidden, hashes[self.engram_indices[index]])
+                previous = previous_post = None
+            hidden, previous, previous_post = layer.forward_f7_ihc(
+                positions, hidden, previous, previous_post
+            )
+        return finish_post(
+            self.layers[-1].hc_mlp_layer, hidden, previous, previous_post
+        )
 
     def _init_expert_mapping(self) -> None:
         mapping = fused_moe_make_expert_params_mapping(
@@ -228,6 +304,12 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
         },
     )
 
+    @property
+    def _lm_head_cls(self):
+        if w8_head_enabled():
+            return W8StorageHead
+        return FP16StorageHead if fp16_storage_enabled() else super()._lm_head_cls
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         if vllm_config.quant_config is not None:
             vllm_config.quant_config.packed_modules_mapping = (
@@ -274,6 +356,21 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
         assert index_path is not None
         index = Path(index_path)
         weight_map = json.loads(index.read_text())["weight_map"]
+        # skip_checkpoint_weight drops these names by suffix. Each dropped
+        # name has to be a table this loop reads, or the load would lose it.
+        suffixes = (_ENGRAM_WEIGHT, _ENGRAM_WEIGHT + "_scale_inv")
+        expected = {
+            f"model.layers.{layer_idx}{suffix}"
+            for layer_idx in self.model.engram_indices
+            for suffix in suffixes
+        }
+        unexpected = sorted(
+            name
+            for name in weight_map
+            if name.endswith(suffixes) and name not in expected
+        )
+        if unexpected:
+            raise ValueError(f"Unexpected Engram table weights: {unexpected}")
         for layer_idx in self.model.engram_indices:
             name = f"model.layers.{layer_idx}{_ENGRAM_WEIGHT}"
             if name + "_scale_inv" not in weight_map:
