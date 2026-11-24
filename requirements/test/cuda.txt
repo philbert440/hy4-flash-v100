@@ -571,7 +571,7 @@ opentelemetry-sdk==1.44.0
     #   ray
 opentelemetry-semantic-conventions==0.65b0
     # via opentelemetry-sdk
-optuna==3.6.1
+optuna==5.1.0
     # via genai-perf
 orjson==3.11.5
     # via genai-perf
