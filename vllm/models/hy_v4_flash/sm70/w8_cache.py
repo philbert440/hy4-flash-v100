@@ -10,6 +10,8 @@ from pathlib import Path
 
 import torch
 
+from .w8_sidecar import SIDECAR_NAME
+
 GROUP_SIZE = 32
 
 # The original fast3 calibration predates rank hashes. Bind its exact
@@ -32,6 +34,8 @@ _CANONICAL_RANK_SHA256 = {
 def pack_identity(checkpoint: Path) -> tuple[str, str]:
     files = {}
     for path in sorted(checkpoint.iterdir()):
+        if path.name == SIDECAR_NAME:
+            continue  # Keep cache keys stable when a checkpoint gains the sidecar.
         if path.suffix == ".json":
             files[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
         elif path.suffix == ".safetensors":

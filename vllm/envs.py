@@ -1189,6 +1189,7 @@ if TYPE_CHECKING:
     HY4_W8_INDEXER: bool = False
     HY4_W8_UV: bool = False
     HY4_W8_SHARED_GROUP_SIZE: int = 128
+    HY4_W8_SHARED_SIDECAR: bool = False
     VLLM_HY4_DFLY_HEAD: str = "fp32"
     VLLM_HY4_DFLY_VERIFY_INDEX: str = "batched"
     VLLM_HY4_DFLY_GATE: str = "off"
@@ -18292,6 +18293,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "HY4_W8_UV": env_var(
         lambda: os.environ.get("HY4_W8_UV", "0") == "1",
         description="Pack Hy4 absorbed value projections as symmetric grouped int8.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "HY4_W8_SHARED_SIDECAR": env_var(
+        lambda: os.environ.get("HY4_W8_SHARED_SIDECAR", "0") == "1",
+        description=(
+            "Read Hy4 shared-expert W8 codes from the checkpoint's "
+            "hy4-v100-shared-w8.safetensors before HY4_W8_SHARED_GPTQ_CACHE."
+        ),
         category="configuration",
         declared_default="False",
         effective_default="False",

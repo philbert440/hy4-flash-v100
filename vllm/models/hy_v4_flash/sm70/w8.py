@@ -112,19 +112,26 @@ def _replace_weight(layer: nn.Module, weight: torch.Tensor) -> None:
 
 
 class _W8Linear(UnquantizedLinearMethod):
-    def __init__(self, group_size: int, packed_cache: str | None):
+    def __init__(self, group_size: int, packed_cache: str | None, sidecar: bool = False):
         self.group_size = group_size
         self.packed_cache = packed_cache
+        self.sidecar = sidecar
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         if layer.weight.dtype == torch.uint8:
             return
         layer._hy4_w8_shape = tuple(layer.weight.shape)
-        if self.packed_cache:
+        packed = None
+        if self.sidecar:
+            from .w8_sidecar import linear_weight
+
+            # None when the checkpoint has no sidecar: fall back to the cache.
+            packed = linear_weight(layer, self.group_size)
+        if packed is None and self.packed_cache:
             from .w8_cache import cached_linear_weight
 
             packed = cached_linear_weight(layer, self.packed_cache, self.group_size)
-        else:
+        if packed is None:
             packed = _pack_at_load(layer.weight, self.group_size)
         _replace_weight(layer, packed)
 
@@ -160,16 +167,18 @@ def enable_linear(layer: nn.Module | None, weight_class: str) -> bool:
         packed_cache = (
             os.getenv("HY4_W8_SHARED_GPTQ_CACHE") if weight_class == "SHARED" else None
         )
+        sidecar = weight_class == "SHARED" and envs.HY4_W8_SHARED_SIDECAR
         if (
             weight_class == "SHARED"
             and envs.VLLM_HY4_PROFILE in ("fast3", "fast4", "fast5", "fast6", "fast7", "fast8")
             and not packed_cache
+            and not sidecar
         ):
             raise ValueError(
                 f"The GPTQ {envs.VLLM_HY4_PROFILE} candidate requires "
                 "HY4_W8_SHARED_GPTQ_CACHE."
             )
-        layer.quant_method = _W8Linear(group_size, packed_cache)
+        layer.quant_method = _W8Linear(group_size, packed_cache, sidecar)
         return True
     return False
 
